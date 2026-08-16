@@ -18,8 +18,8 @@ SCREEN_W = 1920
 SCREEN_H = 1080
 FPS_CAP = 30
 
-TRAIN_UPDATE_SEC = 60       # how often to refresh train positions
-SCHEDULE_UPDATE_SEC = 60    # how often to refresh schedules
+TRAIN_UPDATE_SEC = 30       # how often to refresh train positions
+SCHEDULE_UPDATE_SEC = 30    # how often to refresh schedules
 MOTD_ROTATE_SEC = 30        # how often to cycle train fact
 SCHEDULE_PAGE_ROTATE_SEC = 10  # how often to flip Train Information pages
 
@@ -30,28 +30,22 @@ PANEL_GAP = 16
 
 TILE_SIZE = 256             # OSM tile size in pixels
 TILE_ZOOM = 9               # zoom level (9 zooms in a bit tighter on the origin area)
-
-OSM_TILE_URL = "https://basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png"
-OVERPASS_URLS = (
-    "https://overpass-api.de/api/interpreter",
-    "https://z.overpass-api.de/api/interpreter",
-)
-
-TILE_CACHE_DIR = "~/.cache/train-station/tiles"   # expanded after os import
+OSM_TILE_URL = "https://basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png"
+PAGE_TRAIN_GIF_URL = "https://www.animatedimages.org/data/media/75/animated-train-image-0043.gif"
 
 # ── Colors ──────────────────────────────────────────────────────────
-C_BG          = (10,  14,  20)
-C_PANEL_BG    = (18,  24,  32)
-C_PANEL_BORDER= (40,  60,  80)
-C_HEADER_BG   = (20,  30,  45)
-C_TEXT        = (210, 220, 230)
-C_TEXT_DIM    = (110, 130, 150)
-C_ACCENT      = (80,  180, 255)
-C_ACCENT2     = (255, 200,  50)
+C_BG          = (8,  12,  18)
+C_PANEL_BG    = (16,  22,  30)
+C_PANEL_BORDER= (48,  64,  82)
+C_HEADER_BG   = (16,  22,  30)
+C_TEXT        = (226, 233, 242)
+C_TEXT_DIM    = (144, 159, 176)
+C_ACCENT      = (83,  160, 255)
+C_ACCENT2     = (255, 174, 70)
 C_TRAIN_DOT   = (255, 240,  80)
-C_STATION_DOT = (255,  80,  80)
+C_STATION_DOT = (95,  112, 132)
 C_TRACK       = (100, 200, 100)
-C_SEPARATOR   = (35,  50,  65)
+C_SEPARATOR   = (40,  55,  72)
 C_MOTD_BG     = (15,  22,  35)
 C_MOTD_BORDER = (60,  90, 120)
 
@@ -66,14 +60,11 @@ import time
 import random
 import json
 import threading
-import hashlib
 import io
-from pathlib import Path
+from datetime import datetime, timezone, timedelta
 from collections import OrderedDict
 
 import base64
-import subprocess
-import tempfile
 
 import pygame
 import requests
@@ -199,559 +190,415 @@ def _parse_hex_color(color_hex: str, fallback: tuple[int, int, int]) -> tuple[in
     except Exception:
         return fallback
 
+def _log_http(method: str, url: str, detail: str = ""):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    msg = f"[{ts}] HTTP {method} {url}"
+    if detail:
+        msg += f" :: {detail}"
+    print(msg, flush=True)
+
+def _load_whimsical_train_sprite(target_h: int = 32):
+    """Load train GIF and convert white pixels to transparent for UI overlays."""
+    try:
+        _log_http("GET", PAGE_TRAIN_GIF_URL, "start")
+        resp = requests.get(PAGE_TRAIN_GIF_URL, timeout=8)
+        _log_http("GET", PAGE_TRAIN_GIF_URL, f"status={resp.status_code}")
+        resp.raise_for_status()
+        img = Image.open(io.BytesIO(resp.content)).convert("RGBA")
+        px = img.load()
+        w, h = img.size
+        for yy in range(h):
+            for xx in range(w):
+                r, g, b, _ = px[xx, yy]
+                if r >= 245 and g >= 245 and b >= 245:
+                    px[xx, yy] = (255, 255, 255, 0)
+        out_h = max(12, int(target_h))
+        out_w = max(20, int(w * (out_h / max(1, h))))
+        img = img.resize((out_w, out_h), Image.Resampling.LANCZOS)
+        return pygame.image.fromstring(img.tobytes(), img.size, "RGBA").convert_alpha()
+    except Exception:
+        _log_http("GET", PAGE_TRAIN_GIF_URL, "error")
+        return None
+
 # ═══════════════════════════════════════════════════════════════════
-# SECTION 5: TILE CACHE
+# SECTION 5: TRANSITDOCS CLIENT
 # ═══════════════════════════════════════════════════════════════════
 
-class TileCache:
-    """Downloads and caches map tiles to disk. Thread-safe LRU in-memory cache."""
+class MapTileOverlay:
+    """Non-blocking in-memory tile cache for subdued dark basemap overlay."""
 
-    MAX_MEMORY = 300  # max tiles in memory
-
-    def __init__(self, cache_dir=TILE_CACHE_DIR):
-        self.cache_dir = Path(os.path.expanduser(cache_dir))
-        self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self._mem: OrderedDict = OrderedDict()
+    def __init__(self, url_template: str, max_tiles: int = 420):
+        self.url_template = url_template
+        self.max_tiles = max_tiles
+        self._cache: OrderedDict = OrderedDict()
+        self._pending = set()
         self._lock = threading.Lock()
         self._session = requests.Session()
         self._session.headers.update({
             "User-Agent": "TrainStationKiosk/1.0 (train enthusiast display; contact: kiosk@local)"
         })
 
-    def _tile_path(self, url_template, z, x, y):
-        key = f"{url_template}_{z}_{x}_{y}"
-        hsh = hashlib.md5(key.encode()).hexdigest()
-        return self.cache_dir / hsh[:2] / (hsh + ".png")
-
-    def _mem_key(self, url_template, z, x, y):
-        return (url_template, z, x, y)
-
-    def get(self, url_template, z, x, y) -> pygame.Surface | None:
-        """Return a pygame Surface for the tile, or None if unavailable."""
-        mk = self._mem_key(url_template, z, x, y)
+    def get(self, z: int, x: int, y: int):
+        key = (z, x, y)
         with self._lock:
-            if mk in self._mem:
-                self._mem.move_to_end(mk)
-                return self._mem[mk]
-
-        # try disk cache
-        path = self._tile_path(url_template, z, x, y)
-        if path.exists():
-            surf = self._load_png_surface(path)
-            if surf:
-                self._store_mem(mk, surf)
-                return surf
-
-        # fetch from network
-        url = url_template.replace("{z}", str(z)).replace("{x}", str(x)).replace("{y}", str(y))
-        try:
-            resp = self._session.get(url, timeout=10)
-            if resp.status_code == 200:
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes(resp.content)
-                surf = self._load_png_surface(path)
-                if surf:
-                    self._store_mem(mk, surf)
-                    return surf
-        except Exception:
-            pass
+            if key in self._cache:
+                self._cache.move_to_end(key)
+                return self._cache[key]
+            if key in self._pending:
+                return None
+            self._pending.add(key)
+        threading.Thread(target=self._fetch_tile, args=(key,), daemon=True).start()
         return None
 
-    def _load_png_surface(self, path) -> pygame.Surface | None:
+    def _fetch_tile(self, key):
+        z, x, y = key
+        url = self.url_template.replace("{z}", str(z)).replace("{x}", str(x)).replace("{y}", str(y))
+        surf = None
         try:
-            img = Image.open(path).convert("RGBA")
-            data = img.tobytes()
-            surf = pygame.image.fromstring(data, img.size, "RGBA").convert_alpha()
-            return surf
+            _log_http("GET", url, "start")
+            resp = self._session.get(url, timeout=8)
+            _log_http("GET", url, f"status={resp.status_code}")
+            if resp.status_code == 200:
+                img = Image.open(io.BytesIO(resp.content)).convert("RGBA")
+                surf = pygame.image.fromstring(img.tobytes(), img.size, "RGBA")
         except Exception:
-            return None
+            _log_http("GET", url, "error")
+            surf = None
+        finally:
+            with self._lock:
+                self._pending.discard(key)
+                if surf is not None:
+                    self._cache[key] = surf
+                    self._cache.move_to_end(key)
+                    while len(self._cache) > self.max_tiles:
+                        self._cache.popitem(last=False)
 
-    def _store_mem(self, key, surf):
-        with self._lock:
-            self._mem[key] = surf
-            self._mem.move_to_end(key)
-            while len(self._mem) > self.MAX_MEMORY:
-                self._mem.popitem(last=False)
 
-    def prefetch(self, url_template, z, x_range, y_range):
-        """Background prefetch of a tile grid."""
-        def _fetch():
-            for x in x_range:
-                for y in y_range:
-                    self.get(url_template, z, x, y)
-                    time.sleep(0.05)   # be polite to tile servers
-        t = threading.Thread(target=_fetch, daemon=True)
-        t.start()
+class TransitDocsClient:
+    """Transitdocs-only data client for trains, stations, schedules, and rail overlay."""
 
-# ═══════════════════════════════════════════════════════════════════
-# SECTION 6: OVERPASS CLIENT
-# ═══════════════════════════════════════════════════════════════════
-
-class OverpassClient:
-    """Fetches railway and station data from the Overpass API with caching."""
-
-    INFRA_CACHE_SEC = 600    # 10 minutes for static infrastructure
-    INFRA_EMPTY_RETRY_SEC = 20  # retry quickly when infrastructure comes back empty
-    TRAIN_CACHE_SEC = 60     # 60 seconds for train positions
+    BASE_URLS = (
+        "https://asm.transitdocs.com",
+        "https://asm-backend.transitdocs.com",
+    )
+    CACHE_SEC = 30
+    PROVIDER_COLORS = {
+        "AMTRAK": "#1f6fe5",
+        "VIA": "#e24b4b",
+    }
 
     def __init__(self):
-        self._infra_cache = None
-        self._infra_ts = 0
-        self._infra_bbox_key = None
-        self._train_cache = None
-        self._train_ts = 0
         self._lock = threading.Lock()
+        self._cache_ts = 0.0
+        self._cache = {
+            "trains": [],
+            "stations": [],
+            "station_by_code": {},
+            "tracks": [],
+        }
         self._session = requests.Session()
         self._session.headers.update({
             "User-Agent": "TrainStationKiosk/1.0 (train enthusiast display; contact: kiosk@local)",
             "Accept": "application/json",
         })
 
-    def _query(self, ql: str) -> dict | None:
-        for endpoint in OVERPASS_URLS:
+    def _fetch_json(self, path: str):
+        for base in self.BASE_URLS:
+            url = f"{base.rstrip('/')}/{path.lstrip('/')}"
             try:
-                resp = self._session.post(
-                    endpoint,
-                    data={"data": ql},
-                    timeout=40
-                )
-                if resp.status_code == 200:
-                    return resp.json()
-            except Exception:
+                _log_http("GET", url, "start")
+                resp = self._session.get(url, timeout=20)
+                _log_http("GET", url, f"status={resp.status_code}")
+                if resp.status_code != 200:
+                    continue
+                content_type = (resp.headers.get("content-type") or "").lower()
+                if "json" not in content_type:
+                    continue
+                return resp.json()
+            except (requests.RequestException, json.JSONDecodeError):
+                _log_http("GET", url, "error")
                 continue
         return None
 
-    def get_infrastructure(self, bbox):
-        """
-        Returns dict with 'tracks' (list of way node-lists) and 'stations' (list of nodes).
-        bbox = (min_lat, min_lon, max_lat, max_lon)
-        """
-        bbox_key = tuple(round(v, 4) for v in bbox)
+    def _to_dt(self, ts):
+        if ts is None:
+            return None
+        try:
+            return datetime.fromtimestamp(float(ts), tz=timezone.utc)
+        except (TypeError, ValueError, OSError):
+            return None
+
+    def _bearing_to_heading(self, bearing: float) -> str:
+        dirs = ("N", "NE", "E", "SE", "S", "SW", "W", "NW")
+        idx = int((float(bearing) % 360.0) / 45.0 + 0.5) % len(dirs)
+        return dirs[idx]
+
+    def _refresh_if_needed(self):
         now = time.time()
         with self._lock:
-            if self._infra_cache:
-                cache_age = now - self._infra_ts
-                has_tracks = bool(self._infra_cache.get("tracks"))
-                if has_tracks and cache_age < self.INFRA_CACHE_SEC and self._infra_bbox_key == bbox_key:
-                    return self._infra_cache
-                if (not has_tracks) and cache_age < self.INFRA_EMPTY_RETRY_SEC and self._infra_bbox_key == bbox_key:
-                    return self._infra_cache
+            if now - self._cache_ts < self.CACHE_SEC:
+                return
 
-        min_lat, min_lon, max_lat, max_lon = bbox
-        ql = f"""
-[out:json][timeout:60];
-(
-  way["railway"="rail"]({min_lat},{min_lon},{max_lat},{max_lon});
-  node["railway"="station"]({min_lat},{min_lon},{max_lat},{max_lon});
-  node["railway"="halt"]({min_lat},{min_lon},{max_lat},{max_lon});
-);
-out body geom;
-"""
-        data = self._query(ql)
-        result = self._parse_infrastructure(data)
-        if not result["tracks"]:
-            # Fallback: query smaller boxes to reduce Overpass timeouts and recover rail geometry.
-            merged = {"tracks": [], "stations": []}
-            for sb in self._split_bbox(min_lat, min_lon, max_lat, max_lon):
-                smin_lat, smin_lon, smax_lat, smax_lon = sb
-                ql_small = f"""
-[out:json][timeout:40];
-(
-  way["railway"="rail"]({smin_lat},{smin_lon},{smax_lat},{smax_lon});
-  node["railway"="station"]({smin_lat},{smin_lon},{smax_lat},{smax_lon});
-  node["railway"="halt"]({smin_lat},{smin_lon},{smax_lat},{smax_lon});
-);
-out body geom;
-"""
-                part = self._parse_infrastructure(self._query(ql_small))
-                merged["tracks"].extend(part["tracks"])
-                merged["stations"].extend(part["stations"])
-            result = self._dedupe_infrastructure(merged)
+        map_data = self._fetch_json("map")
+        station_data = self._fetch_json("stationInfo")
+        if not isinstance(map_data, list) or not isinstance(station_data, list):
+            return
 
-        with self._lock:
-            if result.get("tracks"):
-                self._infra_cache = result
-                self._infra_ts = time.time()
-                self._infra_bbox_key = bbox_key
-            else:
-                # Never let an empty fetch wipe out a previously good infrastructure cache.
-                if not self._infra_cache:
-                    self._infra_cache = result
-                    self._infra_ts = time.time()
-                    self._infra_bbox_key = bbox_key
-        return result
-
-    def _parse_infrastructure(self, data) -> dict:
-        tracks = []
+        station_by_code = {}
         stations = []
-        if not data:
-            return {"tracks": tracks, "stations": stations}
+        for st in station_data:
+            code = str(st.get("code") or "").strip().upper()
+            lat = st.get("latitude")
+            lon = st.get("longitude")
+            if not code or lat is None or lon is None:
+                continue
+            try:
+                lat = float(lat)
+                lon = float(lon)
+            except (TypeError, ValueError):
+                continue
+            city = str(st.get("city") or "").strip()
+            state = str(st.get("state") or "").strip()
+            name = city if not state else f"{city}, {state}"
+            station_obj = {
+                "code": code,
+                "name": name or code,
+                "lat": lat,
+                "lon": lon,
+                "active": bool(st.get("active", True)),
+                "show_on_map": bool(st.get("show_on_map", True)),
+            }
+            stations.append(station_obj)
+            station_by_code[code] = station_obj
 
-        node_coords = {}
-        for el in data.get("elements", []):
-            if el["type"] == "node":
-                node_coords[el["id"]] = (el["lat"], el["lon"])
-                tags = el.get("tags", {})
-                if tags.get("railway") in ("station", "halt"):
-                    stations.append({
-                        "lat": el["lat"],
-                        "lon": el["lon"],
-                        "name": tags.get("name", ""),
-                        "operator": tags.get("operator", ""),
-                    })
-
-        for el in data.get("elements", []):
-            if el["type"] == "way" and el.get("tags", {}).get("railway") == "rail":
-                geom = el.get("geometry", [])
-                if geom:
-                    pts = [(g["lat"], g["lon"]) for g in geom]
-                else:
-                    pts = [node_coords[n] for n in el.get("nodes", []) if n in node_coords]
-                if len(pts) >= 2:
-                    tracks.append({
-                        "points": pts,
-                        "name": el.get("tags", {}).get("name", ""),
-                        "maxspeed": el.get("tags", {}).get("maxspeed", ""),
-                    })
-
-        return {"tracks": tracks, "stations": stations}
-
-    def get_trains(self, bbox):
-        """
-        Returns list of train route relations that pass through the bounding box.
-        Uses a tighter bbox around the origin for 'nearby' relevance.
-        """
-        now = time.time()
-        with self._lock:
-            if self._train_cache and now - self._train_ts < self.TRAIN_CACHE_SEC:
-                return self._train_cache
-
-        # Use the full map bbox so all on-screen routes are included
-        d_lat = 200.0 / 69.0
-        d_lon = 200.0 / (69.0 * math.cos(math.radians(ORIGIN_LAT)))
-        min_lat = ORIGIN_LAT - d_lat
-        max_lat = ORIGIN_LAT + d_lat
-        min_lon = ORIGIN_LON - d_lon
-        max_lon = ORIGIN_LON + d_lon
-
-        ql = f"""
-[out:json][timeout:45];
-(
-  relation["type"="route"]["route"="train"]({min_lat},{min_lon},{max_lat},{max_lon});
-  relation["type"="route"]["route"="railway"]({min_lat},{min_lon},{max_lat},{max_lon});
-);
-out tags;
-"""
-        data = self._query(ql)
-        trains = self._parse_trains(data)
-
-        with self._lock:
-            self._train_cache = trains
-            self._train_ts = time.time()
-        return trains
-
-    def _parse_trains(self, data) -> list:
         trains = []
-        if not data:
-            return trains
-        seen = set()
-        for el in data.get("elements", []):
-            if el["type"] == "relation":
-                tags = el.get("tags", {})
-                name = tags.get("name", "")
-                ref  = tags.get("ref", "")
-                op   = tags.get("operator", "")
-                frm  = tags.get("from", "")
-                to   = tags.get("to", "")
-                route_type = tags.get("route", "train")
-
-                # De-duplicate by (operator, ref, from, to)
-                key = (op, ref, frm, to)
-                if key in seen:
-                    continue
-                seen.add(key)
-
-                display = name or (f"{op} {ref}".strip()) or f"Route {el['id']}"
-                trains.append({
-                    "id": el["id"],
-                    "name": display,
-                    "operator": op,
-                    "from": frm,
-                    "to": to,
-                    "ref": ref,
-                    "route_type": route_type,
-                    "colour": tags.get("colour", ""),
-                    "network": tags.get("network", ""),
-                })
-        # Sort: named routes with both from/to first
-        trains.sort(key=lambda r: (0 if r["from"] and r["to"] else 1, r["name"]))
-        return trains
-
-    def _split_bbox(self, min_lat, min_lon, max_lat, max_lon):
-        mid_lat = (min_lat + max_lat) / 2.0
-        mid_lon = (min_lon + max_lon) / 2.0
-        return [
-            (min_lat, min_lon, mid_lat, mid_lon),
-            (min_lat, mid_lon, mid_lat, max_lon),
-            (mid_lat, min_lon, max_lat, mid_lon),
-            (mid_lat, mid_lon, max_lat, max_lon),
-        ]
-
-    def _dedupe_infrastructure(self, infra: dict) -> dict:
         tracks = []
-        seen_tracks = set()
-        for tr in infra.get("tracks", []):
+        seen_segments = set()
+        for raw in map_data:
+            loc = raw.get("location") or {}
+            lat = loc.get("latitude")
+            lon = loc.get("longitude")
+            if lat is None or lon is None:
+                continue
+            try:
+                lat = float(lat)
+                lon = float(lon)
+                speed = max(0.0, float(loc.get("speed") or 0.0))
+                bearing = float(loc.get("heading") or 0.0)
+            except (TypeError, ValueError):
+                continue
+
+            railroad = str(raw.get("railroad") or "").upper()
+            number = str(raw.get("number") or "?")
+            route_name = str(raw.get("name") or f"{railroad} {number}").strip()
+            stops = raw.get("stops") or []
+
+            train = {
+                "provider": railroad,
+                "trainNum": number,
+                "routeName": route_name,
+                "lat": lat,
+                "lon": lon,
+                "velocity": speed,
+                "heading": self._bearing_to_heading(bearing),
+                "iconColor": self.PROVIDER_COLORS.get(railroad, "#e8a020"),
+                "origin_code": str(raw.get("origin") or "").upper(),
+                "destination_code": str(raw.get("destination") or "").upper(),
+                "stops": stops,
+            }
+            trains.append(train)
+
+            route_pts = []
+            for stop in stops:
+                code = str(stop.get("code") or "").strip().upper()
+                st = station_by_code.get(code)
+                if not st:
+                    continue
+                route_pts.append((st["lat"], st["lon"]))
+
+            for i in range(len(route_pts) - 1):
+                a = route_pts[i]
+                b = route_pts[i + 1]
+                if haversine_miles(a[0], a[1], b[0], b[1]) > 450:
+                    continue
+                k1 = (round(a[0], 4), round(a[1], 4))
+                k2 = (round(b[0], 4), round(b[1], 4))
+                key = (k1, k2) if k1 <= k2 else (k2, k1)
+                if key in seen_segments:
+                    continue
+                seen_segments.add(key)
+                tracks.append({"points": [a, b]})
+
+        with self._lock:
+            self._cache = {
+                "trains": trains,
+                "stations": stations,
+                "station_by_code": station_by_code,
+                "tracks": tracks,
+            }
+            self._cache_ts = time.time()
+
+    def _snapshot(self):
+        self._refresh_if_needed()
+        with self._lock:
+            return self._cache.copy()
+
+    def get_infrastructure(self, bbox):
+        min_lat, min_lon, max_lat, max_lon = bbox
+        snap = self._snapshot()
+        stations = []
+        for st in snap["stations"]:
+            if not st.get("show_on_map", True):
+                continue
+            if min_lat <= st["lat"] <= max_lat and min_lon <= st["lon"] <= max_lon:
+                stations.append(st)
+        tracks = []
+        for tr in snap["tracks"]:
             pts = tr.get("points", [])
             if len(pts) < 2:
                 continue
-            key = (round(pts[0][0], 5), round(pts[0][1], 5), round(pts[-1][0], 5), round(pts[-1][1], 5), len(pts))
-            if key in seen_tracks:
-                continue
-            seen_tracks.add(key)
-            tracks.append(tr)
-
-        stations = []
-        seen_stations = set()
-        for st in infra.get("stations", []):
-            key = (round(st.get("lat", 0.0), 5), round(st.get("lon", 0.0), 5), st.get("name", ""))
-            if key in seen_stations:
-                continue
-            seen_stations.add(key)
-            stations.append(st)
+            (a_lat, a_lon), (b_lat, b_lon) = pts[0], pts[-1]
+            if (
+                (min_lat <= a_lat <= max_lat and min_lon <= a_lon <= max_lon)
+                or (min_lat <= b_lat <= max_lat and min_lon <= b_lon <= max_lon)
+            ):
+                tracks.append(tr)
         return {"tracks": tracks, "stations": stations}
 
-# ═══════════════════════════════════════════════════════════════════
-# SECTION 6b: AMTRAKER CLIENT  (live train positions + schedules)
-# ═══════════════════════════════════════════════════════════════════
-
-# Known Amtrak station coordinates (lat, lon) for mid-Atlantic proximity checks
-AMTRAK_STATION_COORDS = {
-    "WAS": (38.8973, -77.0063, "Washington Union"),
-    "BAL": (39.2841, -76.6227, "Baltimore Penn"),
-    "BWI": (39.1771, -76.6688, "BWI Airport"),
-    "NCR": (38.9478, -76.8738, "New Carrollton"),
-    "RKV": (39.0839, -77.1528, "Rockville"),
-    "ABE": (39.5094, -76.1713, "Aberdeen"),
-    "WIL": (39.7369, -75.5513, "Wilmington"),
-    "MRB": (39.4575, -77.9714, "Martinsburg"),
-    "HFY": (39.3253, -77.7283, "Harpers Ferry"),
-    "HAR": (40.2598, -76.8831, "Harrisburg"),
-    "LNC": (40.0415, -76.3008, "Lancaster"),
-    "PHL": (39.9566, -75.1822, "Philadelphia 30th St"),
-    "ALX": (38.8056, -77.0583, "Alexandria"),
-    "FBG": (38.3014, -77.4614, "Fredericksburg"),
-    "CUM": (39.6481, -78.7606, "Cumberland"),
-    "GAI": (39.1437, -77.2011, "Gaithersburg"),   # approx, not Amtrak
-}
-
-def station_distance_from_origin(station_code: str) -> float:
-    """Return miles from ORIGIN to a known station, or 9999."""
-    info = AMTRAK_STATION_COORDS.get(station_code)
-    if not info:
-        return 9999.0
-    return haversine_miles(ORIGIN_LAT, ORIGIN_LON, info[0], info[1])
-
-
-class AmtrakerClient:
-    """
-    Fetches live Amtrak train positions and schedules from the public
-    Amtraker API (api-v3.amtraker.com). No API key required.
-    """
-
-    API_URL = "https://api-v3.amtraker.com/v3/trains"
-    CACHE_SEC = 60
-    EXCLUDED_ROUTE_KEYWORDS = (
-        "metro", "subway", "light rail", "tram", "streetcar",
-        "wmata", "mta", "mbta", "septa", "bart", "path",
-    )
-
-    def __init__(self):
-        self._cache = None
-        self._ts = 0
-        self._lock = threading.Lock()
-        self._session = requests.Session()
-        self._session.headers.update({"User-Agent": "TrainStationKiosk/1.0"})
-
-    def get_all_trains(self) -> list:
-        """Return list of all active train dicts, refreshed every CACHE_SEC."""
-        now = time.time()
-        with self._lock:
-            if self._cache is not None and now - self._ts < self.CACHE_SEC:
-                return self._cache
-
-        trains = self._fetch()
-        with self._lock:
-            self._cache = trains
-            self._ts = time.time()
-        return trains
-
-    def get_trains_in_bbox(self, bbox) -> list:
-        """Return only trains whose current position falls within bbox."""
+    def get_trains_in_bbox(self, bbox):
         min_lat, min_lon, max_lat, max_lon = bbox
+        snap = self._snapshot()
         return [
-            t for t in self.get_all_trains()
-            if self._is_mainline_passenger_train(t)
-            and t.get("lat") and t.get("lon")
-            and min_lat <= t["lat"] <= max_lat
-            and min_lon <= t["lon"] <= max_lon
+            t for t in snap["trains"]
+            if min_lat <= t["lat"] <= max_lat and min_lon <= t["lon"] <= max_lon
         ]
 
-    def get_nearby_schedule(self, radius_miles: float = SCHEDULE_RADIUS_MILES) -> list:
-        """
-        Return schedule entries for upcoming stops at stations within radius_miles.
-        Each entry: {train_num, route_name, station_name, station_code,
-                     sch_dep, est_dep, status, delay_min, dist_miles,
-                     destination, next_stop, direction, speed_mph}
-        """
-        from datetime import datetime, timezone, timedelta
-        entries = []
-        best_by_train_num = {}
-        now_utc = datetime.now(timezone.utc)
+    def _stop_name(self, station_by_code, code: str) -> str:
+        st = station_by_code.get(code)
+        if not st:
+            return code
+        return st.get("name", code)
 
-        for train in self.get_all_trains():
-            if not self._is_mainline_passenger_train(train):
+    def _next_stop_name(self, train: dict, station_by_code: dict) -> str:
+        now_utc = datetime.now(timezone.utc)
+        for stop in train.get("stops", []):
+            if stop.get("canceled"):
                 continue
+            pred = self._to_dt(stop.get("depart") or stop.get("arrive"))
+            if pred and pred >= now_utc - timedelta(minutes=2):
+                code = str(stop.get("code") or "").strip().upper()
+                return self._stop_name(station_by_code, code)
+        return "—"
+
+    def _destination_name(self, train: dict, station_by_code: dict) -> str:
+        code = str(train.get("destination_code") or "").strip().upper()
+        if code:
+            return self._stop_name(station_by_code, code)
+        for stop in reversed(train.get("stops", [])):
+            code = str(stop.get("code") or "").strip().upper()
+            if code:
+                return self._stop_name(station_by_code, code)
+        return str(train.get("routeName") or "Unknown")
+
+    def _station_distance(self, station_by_code: dict, code: str, fallback: float) -> float:
+        st = station_by_code.get(code)
+        if not st:
+            return fallback
+        return haversine_miles(ORIGIN_LAT, ORIGIN_LON, st["lat"], st["lon"])
+
+    def _stop_status(self, stop: dict, pred_dt: datetime, sch_dt: datetime, now_utc: datetime) -> str:
+        if stop.get("canceled"):
+            return "Canceled"
+        if pred_dt < now_utc - timedelta(minutes=2):
+            return "Departed"
+        delay_min = int((pred_dt - sch_dt).total_seconds() / 60)
+        if delay_min > 2:
+            return "Late"
+        if delay_min < -2:
+            return "Early"
+        return "On Time"
+
+    def get_nearby_schedule(self, radius_miles: float = SCHEDULE_RADIUS_MILES) -> list:
+        snap = self._snapshot()
+        station_by_code = snap["station_by_code"]
+        now_utc = datetime.now(timezone.utc)
+        entries = []
+
+        for train in snap["trains"]:
+            train_dist = haversine_miles(ORIGIN_LAT, ORIGIN_LON, train["lat"], train["lon"])
+            if train_dist > radius_miles:
+                continue
+
             num = train.get("trainNum", "?")
             route = train.get("routeName", "")
-            destination = self._get_destination_name(train)
-            next_stop = self._get_next_stop_name(train)
-            direction = (str(train.get("heading") or "")).upper().strip() or "?"
-            try:
-                speed_mph = max(0.0, float(train.get("velocity") or 0.0))
-            except Exception:
-                speed_mph = 0.0
-            train_lat = train.get("lat")
-            train_lon = train.get("lon")
-            train_dist = None
-            if train_lat and train_lon:
-                train_dist = haversine_miles(ORIGIN_LAT, ORIGIN_LON, train_lat, train_lon)
-                if train_dist > radius_miles:
-                    continue
+            destination = self._destination_name(train, station_by_code)
+            next_stop = self._next_stop_name(train, station_by_code)
+            direction = str(train.get("heading") or "?")
+            speed_mph = float(train.get("velocity") or 0.0)
 
             best_entry = None
-            for stop in train.get("stations", []):
-                code = stop.get("code", "")
-                station_dist = station_distance_from_origin(code)
-                dist = station_dist if station_dist < 9999 else (train_dist if train_dist is not None else 9999.0)
-
-                # use estimated departure if available, else scheduled
-                dep_str = stop.get("dep") or stop.get("schDep") or ""
-                sch_str = stop.get("schDep") or ""
-                status  = stop.get("status", "")
-
-                if not dep_str:
+            for stop in train.get("stops", []):
+                if stop.get("canceled"):
+                    continue
+                code = str(stop.get("code") or "").strip().upper()
+                pred_dt = self._to_dt(stop.get("depart") or stop.get("arrive"))
+                sch_dt = self._to_dt(stop.get("sched_depart") or stop.get("sched_arrive"))
+                if pred_dt is None:
+                    continue
+                if sch_dt is None:
+                    sch_dt = pred_dt
+                if pred_dt < now_utc - timedelta(minutes=2):
                     continue
 
-                try:
-                    dep_dt = datetime.fromisoformat(dep_str)
-                    sch_dt = datetime.fromisoformat(sch_str) if sch_str else dep_dt
-                    # skip stops that already departed more than 2 minutes ago
-                    if dep_dt < now_utc and status == "Departed":
-                        continue
-                    delay_min = int((dep_dt - sch_dt).total_seconds() / 60)
-                    candidate = {
-                        "train_num":    num,
-                        "route_name":   route,
-                        "station_name": stop.get("name", code),
-                        "station_code": code,
-                        "sch_dep":      sch_dt,
-                        "est_dep":      dep_dt,
-                        "status":       status,
-                        "delay_min":    delay_min,
-                        "dist_miles":   dist,
-                        "train_lat":    train_lat,
-                        "train_lon":    train_lon,
-                        "destination":  destination,
-                        "next_stop":    next_stop,
-                        "direction":    direction,
-                        "speed_mph":    speed_mph,
-                    }
-                    if best_entry is None:
-                        best_entry = candidate
-                    else:
-                        # Keep one row per train: earliest upcoming stop wins; distance breaks ties.
-                        if (candidate["est_dep"], candidate["dist_miles"]) < (
-                            best_entry["est_dep"], best_entry["dist_miles"]
-                        ):
-                            best_entry = candidate
-                except Exception:
-                    continue
+                delay_min = int((pred_dt - sch_dt).total_seconds() / 60)
+                status = self._stop_status(stop, pred_dt, sch_dt, now_utc)
+                dist = self._station_distance(station_by_code, code, train_dist)
+                station_name = self._stop_name(station_by_code, code)
 
-            if best_entry is None and train_dist is not None:
-                # Fallback row so visible trains without usable stop times still appear in Train Information.
+                candidate = {
+                    "train_num": num,
+                    "route_name": route,
+                    "station_name": station_name,
+                    "station_code": code,
+                    "sch_dep": sch_dt,
+                    "est_dep": pred_dt,
+                    "status": status,
+                    "delay_min": delay_min,
+                    "dist_miles": dist,
+                    "train_lat": train["lat"],
+                    "train_lon": train["lon"],
+                    "destination": destination,
+                    "next_stop": next_stop,
+                    "direction": direction,
+                    "speed_mph": speed_mph,
+                }
+                if best_entry is None or (candidate["est_dep"], candidate["dist_miles"]) < (
+                    best_entry["est_dep"], best_entry["dist_miles"]
+                ):
+                    best_entry = candidate
+
+            if best_entry is None:
                 best_entry = {
-                    "train_num":    num,
-                    "route_name":   route,
+                    "train_num": num,
+                    "route_name": route,
                     "station_name": next_stop if next_stop != "—" else destination,
                     "station_code": "",
-                    "sch_dep":      now_utc + timedelta(days=7),
-                    "est_dep":      now_utc + timedelta(days=7),
-                    "status":       "Enroute",
-                    "delay_min":    0,
-                    "dist_miles":   train_dist,
-                    "train_lat":    train_lat,
-                    "train_lon":    train_lon,
-                    "destination":  destination,
-                    "next_stop":    next_stop,
-                    "direction":    direction,
-                    "speed_mph":    speed_mph,
+                    "sch_dep": now_utc + timedelta(days=7),
+                    "est_dep": now_utc + timedelta(days=7),
+                    "status": "Enroute",
+                    "delay_min": 0,
+                    "dist_miles": train_dist,
+                    "train_lat": train["lat"],
+                    "train_lon": train["lon"],
+                    "destination": destination,
+                    "next_stop": next_stop,
+                    "direction": direction,
+                    "speed_mph": speed_mph,
                 }
+            entries.append(best_entry)
 
-            if best_entry is not None:
-                tnum = str(best_entry.get("train_num", "?"))
-                prev = best_by_train_num.get(tnum)
-                if prev is None or (best_entry["est_dep"], best_entry["dist_miles"]) < (
-                    prev["est_dep"], prev["dist_miles"]
-                ):
-                    best_by_train_num[tnum] = best_entry
-
-        entries = list(best_by_train_num.values())
-        # sort by estimated departure time
         entries.sort(key=lambda e: e["est_dep"])
         return entries
-
-    def _fetch(self) -> list:
-        try:
-            resp = self._session.get(self.API_URL, timeout=20)
-            if resp.status_code == 200:
-                data = resp.json()
-                trains = []
-                for num, group in data.items():
-                    for t in group:
-                        trains.append(t)
-                return trains
-        except Exception:
-            pass
-        with self._lock:
-            return self._cache if self._cache is not None else []
-
-    def _is_mainline_passenger_train(self, train: dict) -> bool:
-        route_name = str(train.get("routeName") or "").lower()
-        if any(keyword in route_name for keyword in self.EXCLUDED_ROUTE_KEYWORDS):
-            return False
-
-        # Amtrak train numbers are numeric; filter out line-style IDs often used by metro systems.
-        train_num = str(train.get("trainNum") or "").strip()
-        if not any(ch.isdigit() for ch in train_num):
-            return False
-
-        return True
-
-    def _get_destination_name(self, train: dict) -> str:
-        for stop in reversed(train.get("stations", [])):
-            name = (stop.get("name") or "").strip()
-            if name:
-                return name
-        return str(train.get("routeName") or "").strip() or "Unknown"
-
-    def _get_next_stop_name(self, train: dict) -> str:
-        for stop in train.get("stations", []):
-            status = (stop.get("status") or "").strip().lower()
-            if status not in {"departed", "arrived", "completed", "cancelled"}:
-                name = (stop.get("name") or stop.get("code") or "").strip()
-                if name:
-                    return name
-        return "—"
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1021,11 +868,11 @@ def _make_train_sprite(color: tuple, size: int = 48) -> pygame.Surface:
 class MapRenderer:
     """Renders the tiled map with railway overlay and train/station markers."""
 
-    def __init__(self, tile_cache: TileCache, width: int, height: int):
-        self.tile_cache = tile_cache
+    def __init__(self, width: int, height: int):
         self.width = width
         self.height = height
         self.zoom = TILE_ZOOM
+        self.tile_overlay = MapTileOverlay(OSM_TILE_URL)
 
         # fractional tile position of the origin lat/lon
         lat_r = math.radians(ORIGIN_LAT)
@@ -1046,13 +893,6 @@ class MapRenderer:
         self.origin_tile_y = int(self._origin_fty) - tiles_y // 2
         self.tiles_x = tiles_x + 2
         self.tiles_y = tiles_y + 2
-
-        # kick off prefetch of basemap tiles only
-        tile_cache.prefetch(
-            OSM_TILE_URL, self.zoom,
-            range(self.origin_tile_x, self.origin_tile_x + self.tiles_x),
-            range(self.origin_tile_y, self.origin_tile_y + self.tiles_y),
-        )
 
         self._surface = pygame.Surface((width, height))
 
@@ -1099,24 +939,59 @@ class MapRenderer:
         """Draw map onto the provided surface."""
         self._surface.fill(C_BG)
 
-        # draw CartoDB light basemap tiles
+        # draw dark tile overlay (non-blocking; fallback draws subtle grid while loading)
+        tile_drawn = False
         for dx in range(self.tiles_x):
             for dy in range(self.tiles_y):
                 tx = self.origin_tile_x + dx
                 ty = self.origin_tile_y + dy
-                tile = self.tile_cache.get(OSM_TILE_URL, self.zoom, tx, ty)
                 px = int(self._cx_px + (tx - self._origin_ftx) * TILE_SIZE)
                 py = int(self._cy_px + (ty - self._origin_fty) * TILE_SIZE)
-                if tile:
+                tile = self.tile_overlay.get(self.zoom, tx, ty)
+                if tile is not None:
                     self._surface.blit(tile, (px, py))
+                    tile_drawn = True
                 else:
-                    pygame.draw.rect(self._surface, (235, 235, 228),
-                                     pygame.Rect(px, py, TILE_SIZE, TILE_SIZE))
-                    pygame.draw.rect(self._surface, (210, 210, 200),
-                                     pygame.Rect(px, py, TILE_SIZE, TILE_SIZE), 1)
+                    pygame.draw.rect(self._surface, (16, 22, 32), pygame.Rect(px, py, TILE_SIZE, TILE_SIZE))
 
-        # draw Amtrak station markers from known coordinates
-        for code, (slat, slon, sname) in AMTRAK_STATION_COORDS.items():
+        if not tile_drawn:
+            grid_color = (20, 28, 40)
+            for gx in range(0, self.width, 64):
+                pygame.draw.line(self._surface, grid_color, (gx, 0), (gx, self.height), 1)
+            for gy in range(0, self.height, 64):
+                pygame.draw.line(self._surface, grid_color, (0, gy), (self.width, gy), 1)
+
+        # keep the theme subdued to match prior appearance
+        tone = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
+        tone.fill((0, 0, 0, 55))
+        self._surface.blit(tone, (0, 0))
+
+        # draw rail infrastructure lines (ASM-style visible track overlay)
+        tracks = (infrastructure or {}).get("tracks", [])
+        for tr in tracks:
+            pts = tr.get("points", [])
+            if len(pts) < 2:
+                continue
+            px_pts = []
+            for lat, lon in pts:
+                px, py = self._latlon_to_px(lat, lon)
+                if -128 <= px <= self.width + 128 and -128 <= py <= self.height + 128:
+                    px_pts.append((px, py))
+            if len(px_pts) < 2:
+                continue
+            try:
+                pygame.draw.lines(self._surface, (22, 28, 38), False, px_pts, 5)
+                pygame.draw.lines(self._surface, (133, 158, 188), False, px_pts, 2)
+            except Exception:
+                continue
+
+        # draw station markers from Transitdocs stationInfo
+        for st in (infrastructure or {}).get("stations", []):
+            slat = st.get("lat")
+            slon = st.get("lon")
+            sname = st.get("name", "")
+            if slat is None or slon is None:
+                continue
             px, py = self._latlon_to_px(slat, slon)
             if -10 <= px < self.width + 10 and -10 <= py < self.height + 10:
                 pygame.draw.circle(self._surface, C_STATION_DOT, (px, py), 5)
@@ -1206,33 +1081,46 @@ class MapRenderer:
 # ═══════════════════════════════════════════════════════════════════
 
 class SchedulePanel:
-    """Displays upcoming Amtrak stops at nearby stations with real times."""
+    """Displays ASM-style live train cards in a compact side drawer."""
 
     def __init__(self, rect: pygame.Rect):
         self.rect = rect
-        self._entries = []       # list of schedule entry dicts from AmtrakerClient
+        self._entries = []       # list of schedule entry dicts from TransitDocsClient
         self._last_update = 0
         self._page_started = time.time()
+        self._page_train_sprite = _load_whimsical_train_sprite(target_h=32)
 
     def update(self, entries: list):
-        """entries from AmtrakerClient.get_nearby_schedule()"""
+        """entries from TransitDocsClient.get_nearby_schedule()"""
         self._entries = entries[:]
         self._last_update = time.time()
         self._page_started = time.time()
 
     def render(self, surface: pygame.Surface, font_title: pygame.font.Font,
                font_body: pygame.font.Font, font_small: pygame.font.Font):
-        from datetime import datetime, timezone
         r = self.rect
-        pygame.draw.rect(surface, C_PANEL_BG, r)
-        pygame.draw.rect(surface, C_PANEL_BORDER, r, 1)
+        panel = pygame.Surface((r.width, r.height), pygame.SRCALPHA)
+        panel.fill((12, 17, 25, 214))
+        surface.blit(panel, r.topleft)
+        pygame.draw.rect(surface, C_PANEL_BORDER, r, 1, border_radius=12)
 
-        y = r.top + 10
+        y = r.top + 12
+        x = r.left + 12
+        content_w = r.width - 24
         now_utc = datetime.now(timezone.utc)
 
+        title = font_title.render("Intercity Rail Map", True, C_TEXT)
+        subtitle = font_small.render("Live Trains Nearby", True, C_TEXT_DIM)
+        surface.blit(title, (x, y))
+        y += title.get_height() + 1
+        surface.blit(subtitle, (x, y))
+        y += subtitle.get_height() + 8
+        pygame.draw.line(surface, C_SEPARATOR, (x, y), (x + content_w, y), 1)
+        y += 8
+
         if self._entries:
-            row_h = font_body.get_height() + (font_small.get_height() * 2) + 6
-            footer_h = font_small.get_height() + 14
+            row_h = 64
+            footer_h = 30
             available_h = max(0, (r.bottom - footer_h) - y)
             rows_per_page = max(1, available_h // row_h)
             total_pages = max(1, math.ceil(len(self._entries) / rows_per_page))
@@ -1242,7 +1130,6 @@ class SchedulePanel:
             page_entries = self._entries[page_start:page_start + rows_per_page]
 
             for entry in page_entries:
-
                 num        = str(entry.get("train_num", "?"))
                 route      = entry.get("route_name", "")
                 stn        = entry.get("station_name", "?")[:16]
@@ -1256,80 +1143,97 @@ class SchedulePanel:
                 direction   = str(entry.get("direction", "?"))
                 speed_mph   = float(entry.get("speed_mph") or 0.0)
 
-                # format scheduled time in local tz
                 try:
-                    local_sch = sch.astimezone()
-                    time_str = local_sch.strftime("%H:%M")
+                    time_str = sch.astimezone().strftime("%H:%M")
                 except Exception:
                     time_str = "--:--"
 
-                # color by status/delay
+                try:
+                    mins = int((est - now_utc).total_seconds() / 60)
+                    eta = "NOW" if mins <= 0 else f"{mins}m"
+                except Exception:
+                    eta = "--"
+
+                card = pygame.Rect(x, y, content_w, 58)
+                pygame.draw.rect(surface, (20, 27, 37), card, border_radius=8)
+                pygame.draw.rect(surface, (50, 67, 88), card, 1, border_radius=8)
+
+                row1 = font_body.render(f"#{num}  {route[:16]}", True, C_TEXT)
+                row2 = font_small.render(
+                    f"{stn} • ETA {eta} • {direction} {speed_mph:.0f} mph",
+                    True, C_TEXT_DIM
+                )
+                row3 = font_small.render(
+                    f"to {destination[:16]} • next {next_stop[:14]} • {time_str}",
+                    True, C_TEXT_DIM
+                )
+                surface.blit(row1, (card.left + 10, card.top + 6))
+                surface.blit(row2, (card.left + 10, card.top + 25))
+                surface.blit(row3, (card.left + 10, card.top + 41))
+
                 if status == "Departed":
-                    row_color = C_TEXT_DIM
+                    chip_bg = (66, 76, 90)
+                    chip_fg = (214, 221, 230)
                 elif delay > 15:
-                    row_color = (255, 100, 80)
+                    chip_bg = (145, 49, 49)
+                    chip_fg = (255, 234, 234)
                 elif delay > 5:
-                    row_color = C_ACCENT2
+                    chip_bg = (122, 85, 20)
+                    chip_fg = (255, 233, 188)
+                elif delay < -2:
+                    chip_bg = (25, 92, 69)
+                    chip_fg = (212, 252, 237)
                 else:
-                    row_color = C_TEXT
+                    chip_bg = (32, 96, 62)
+                    chip_fg = (220, 249, 230)
 
                 delay_tag = ""
                 if delay > 2:
                     delay_tag = f"+{delay}m"
                 elif delay < -2:
                     delay_tag = f"{delay}m"
-
-                status_short = (status or "Sched")[:8]
-                row_text = f"  #{num:<6} {stn:<18} {time_str:>6}  {status_short:<8} {delay_tag}"
-                row = font_body.render(row_text[:52], True, row_color)
-                surface.blit(row, (r.left, y))
-                y += row.get_height()
-
-                # sub-line 1: route + destination + nearest-station distance
-                sub = font_small.render(
-                    f"    {route[:16]}  to {destination[:16]}  ({dist:.0f} mi)",
-                    True, C_TEXT_DIM
+                chip_text = ((status or "On Time") + (" " + delay_tag if delay_tag else "")).strip()[:14]
+                chip = font_small.render(chip_text, True, chip_fg)
+                chip_pad_x = 8
+                chip_pad_y = 3
+                chip_rect = pygame.Rect(
+                    card.right - chip.get_width() - (chip_pad_x * 2) - 8,
+                    card.top + 7,
+                    chip.get_width() + (chip_pad_x * 2),
+                    chip.get_height() + (chip_pad_y * 2),
                 )
-                surface.blit(sub, (r.left, y))
-                y += sub.get_height() + 1
-
-                # sub-line 2: next stop + ETA + direction/speed
-                try:
-                    mins = int((est - now_utc).total_seconds() / 60)
-                    if mins <= 0:
-                        eta = "NOW"
-                    else:
-                        eta = f"{mins}m"
-                except Exception:
-                    eta = "--"
-                sub2 = font_small.render(
-                    f"    next: {next_stop[:16]}  ETA {eta:<4}  {direction:>2} {speed_mph:.0f} mph",
-                    True, C_TEXT_DIM
-                )
-                surface.blit(sub2, (r.left, y))
-                y += sub2.get_height() + 4
+                pygame.draw.rect(surface, chip_bg, chip_rect, border_radius=10)
+                surface.blit(chip, (chip_rect.left + chip_pad_x, chip_rect.top + chip_pad_y))
+                y += 64
 
             if total_pages > 1:
                 page_label = font_small.render(
                     f"Page {page_idx + 1}/{total_pages}", True, C_TEXT_DIM
                 )
-                surface.blit(page_label, (r.right - page_label.get_width() - 8, r.bottom - page_label.get_height() - 6))
+                surface.blit(page_label, (r.right - page_label.get_width() - 12, r.bottom - page_label.get_height() - 8))
 
                 frac = (elapsed % SCHEDULE_PAGE_ROTATE_SEC) / SCHEDULE_PAGE_ROTATE_SEC
-                bar_w = int((r.width - 20) * (1.0 - frac))
-                if bar_w > 0:
-                    pygame.draw.rect(surface, C_ACCENT,
-                                     pygame.Rect(r.left + 10, r.bottom - 6, bar_w, 3))
+                track_l = r.left + 10
+                track_r = r.right - 10
+                track_y = r.bottom - 6
+                progress_x = track_l + int((track_r - track_l) * (1.0 - frac))
+                pygame.draw.line(surface, C_SEPARATOR, (track_l, track_y), (track_r, track_y), 2)
+                pygame.draw.line(surface, C_ACCENT, (track_l, track_y), (progress_x, track_y), 3)
+                if self._page_train_sprite is not None:
+                    sx = progress_x - (self._page_train_sprite.get_width() // 2)
+                    sy = track_y - self._page_train_sprite.get_height() + 1
+                    surface.blit(self._page_train_sprite, (sx, sy))
+                else:
+                    pygame.draw.circle(surface, C_ACCENT2, (progress_x, track_y), 4)
 
         else:
-            msg = font_body.render("  Fetching schedule data…", True, C_TEXT_DIM)
-            surface.blit(msg, (r.left + 8, y))
+            msg = font_body.render("Loading live train cards…", True, C_TEXT_DIM)
+            surface.blit(msg, (x, y + 6))
 
-        # last update footer
         if self._last_update:
             ts = time.strftime("%H:%M:%S", time.localtime(self._last_update))
             upd = font_small.render(f"Updated {ts}", True, C_TEXT_DIM)
-            surface.blit(upd, (r.left + 8, r.bottom - upd.get_height() - 4))
+            surface.blit(upd, (x, r.bottom - upd.get_height() - 8))
 
 # ═══════════════════════════════════════════════════════════════════
 # SECTION 9: UPCOMING WATCH PANEL
@@ -1441,6 +1345,7 @@ class MotdPanel:
         self._index = 0
         self._last_rotate = time.time()
         self._current = self._facts[0]
+        self._scroll_train_sprite = _load_whimsical_train_sprite(target_h=28)
 
     def update(self):
         if time.time() - self._last_rotate >= MOTD_ROTATE_SEC:
@@ -1485,13 +1390,21 @@ class MotdPanel:
             surface.blit(lbl, (r.left + 12, y))
             y += font_body.get_height() + 2
 
-        # countdown bar
+        # countdown bar with sprite leader
         elapsed = time.time() - self._last_rotate
         frac = min(1.0, elapsed / MOTD_ROTATE_SEC)
-        bar_w = int((r.width - 20) * (1.0 - frac))
-        if bar_w > 0:
-            pygame.draw.rect(surface, C_ACCENT,
-                             pygame.Rect(r.left + 10, r.bottom - 6, bar_w, 3))
+        track_l = r.left + 10
+        track_r = r.right - 10
+        track_y = r.bottom - 6
+        progress_x = track_l + int((track_r - track_l) * (1.0 - frac))
+        pygame.draw.line(surface, C_SEPARATOR, (track_l, track_y), (track_r, track_y), 2)
+        pygame.draw.line(surface, C_ACCENT, (track_l, track_y), (progress_x, track_y), 3)
+        if self._scroll_train_sprite is not None:
+            sx = progress_x - (self._scroll_train_sprite.get_width() // 2)
+            sy = track_y - self._scroll_train_sprite.get_height() + 1
+            surface.blit(self._scroll_train_sprite, (sx, sy))
+        else:
+            pygame.draw.circle(surface, C_ACCENT2, (progress_x, track_y), 4)
 
 # ═══════════════════════════════════════════════════════════════════
 # SECTION 11: MAIN APPLICATION
@@ -1516,36 +1429,33 @@ class TrainStationApp:
         # fonts
         self._init_fonts()
 
-        # layout rects
-        content_w = self.screen_w - (PANEL_GAP * 2)
-        map_w = int((content_w - PANEL_GAP) * 0.70)
-        right_x = PANEL_GAP + map_w + PANEL_GAP
-        right_w = content_w - map_w - PANEL_GAP
-
-        self.map_rect = pygame.Rect(PANEL_GAP, PANEL_GAP, map_w, self.screen_h - (PANEL_GAP * 2))
-        header_h = 60
-        self.header_rect = pygame.Rect(right_x, PANEL_GAP, right_w, header_h)
-
-        side_content_h = self.screen_h - self.header_rect.bottom - (PANEL_GAP * 2)
-        schedule_h = side_content_h
-
-        self.schedule_rect = pygame.Rect(right_x, self.header_rect.bottom + PANEL_GAP, right_w, schedule_h)
+        # ASM-style layout: full-screen map + floating cards
+        self.map_rect = pygame.Rect(0, 0, self.screen_w, self.screen_h)
+        self.header_rect = pygame.Rect(PANEL_GAP, PANEL_GAP, min(560, self.screen_w - (PANEL_GAP * 2)), 74)
+        drawer_w = min(440, int(self.screen_w * 0.32))
+        fact_h = max(150, min(200, int(self.screen_h * 0.18)))
+        self.schedule_rect = pygame.Rect(
+            self.screen_w - drawer_w - PANEL_GAP,
+            PANEL_GAP,
+            drawer_w,
+            self.screen_h - (PANEL_GAP * 3) - fact_h
+        )
         self.motd_rect = pygame.Rect(
-            self.map_rect.left + PANEL_GAP,
-            self.screen_h - PANEL_GAP - BOTTOM_PANEL_H,
-            self.map_rect.width - (PANEL_GAP * 2),
-            BOTTOM_PANEL_H
+            self.screen_w - drawer_w - PANEL_GAP,
+            self.screen_h - PANEL_GAP - fact_h,
+            drawer_w,
+            fact_h
         )
 
         # subsystems
-        self.tile_cache = TileCache()
-        self.amtraker = AmtrakerClient()
-        self.map_renderer = MapRenderer(self.tile_cache, self.map_rect.width, self.map_rect.height)
+        self.transitdocs = TransitDocsClient()
+        self.map_renderer = MapRenderer(self.map_rect.width, self.map_rect.height)
         self.schedule_panel = SchedulePanel(self.schedule_rect)
         self.motd_panel = MotdPanel(self.motd_rect)
 
         # data state
         self._amtrak_trains = []   # live train positions for map
+        self._infrastructure = {"tracks": [], "stations": []}
         self._bbox = self.map_renderer.get_view_bbox(pad_px=120)
         self._last_data_update = 0
         self._data_lock = threading.Lock()
@@ -1571,32 +1481,26 @@ class TrainStationApp:
             except Exception:
                 pass
 
-        self.font_title = pygame.font.SysFont(body_font, 20, bold=True) if body_font else pygame.font.Font(None, 22)
-        self.font_body = pygame.font.SysFont(body_font, 18) if body_font else pygame.font.Font(None, 20)
+        self.font_title = pygame.font.SysFont(body_font, 22, bold=True) if body_font else pygame.font.Font(None, 24)
+        self.font_body = pygame.font.SysFont(body_font, 17) if body_font else pygame.font.Font(None, 19)
         self.font_fact = pygame.font.SysFont(body_font, 21) if body_font else pygame.font.Font(None, 24)
-        self.font_small = pygame.font.SysFont(body_font, 15) if body_font else pygame.font.Font(None, 17)
-        self.font_clock = pygame.font.SysFont(body_font, 32, bold=True) if body_font else pygame.font.Font(None, 36)
+        self.font_small = pygame.font.SysFont(body_font, 14) if body_font else pygame.font.Font(None, 16)
+        self.font_clock = pygame.font.SysFont(body_font, 28, bold=True) if body_font else pygame.font.Font(None, 32)
 
     def _fetch_data(self):
-        """Fetch Amtrak data for map + information panel."""
-        amtrak_trains = [None]
-        amtrak_sched  = [None]
+        """Fetch Transitdocs data for map + information drawer."""
+        amtrak_trains = self.transitdocs.get_trains_in_bbox(self._bbox)
+        amtrak_sched = self.transitdocs.get_nearby_schedule(MAP_RADIUS_MILES)
+        infrastructure = self.transitdocs.get_infrastructure(self._bbox)
 
-        def fetch_amtrak():
-            amtrak_trains[0] = self.amtraker.get_trains_in_bbox(self._bbox)
-            amtrak_sched[0]  = self.amtraker.get_nearby_schedule(MAP_RADIUS_MILES)
-
-        t_amtrak = threading.Thread(target=fetch_amtrak, daemon=True)
-        t_amtrak.start()
-
-        # Amtrak is fast (~1s); update map immediately when it returns
-        t_amtrak.join(timeout=25)
-        if amtrak_trains[0] is not None:
-            with self._data_lock:
-                self._amtrak_trains = amtrak_trains[0]
+        with self._data_lock:
+            if amtrak_trains is not None:
+                self._amtrak_trains = amtrak_trains
                 self._last_data_update = time.time()
-            if amtrak_sched[0]:
-                self.schedule_panel.update(amtrak_sched[0])
+            if infrastructure is not None:
+                self._infrastructure = infrastructure
+        if amtrak_sched:
+            self.schedule_panel.update(amtrak_sched)
 
     def _schedule_data_update(self):
         t = threading.Thread(target=self._fetch_data, daemon=True)
@@ -1604,33 +1508,39 @@ class TrainStationApp:
 
     def _render_header(self):
         r = self.header_rect
-        pygame.draw.rect(self.screen, C_HEADER_BG, r)
-        pygame.draw.rect(self.screen, C_PANEL_BORDER, r, 1)
+        header = pygame.Surface((r.width, r.height), pygame.SRCALPHA)
+        header.fill((14, 20, 28, 214))
+        self.screen.blit(header, r.topleft)
+        pygame.draw.rect(self.screen, C_PANEL_BORDER, r, 1, border_radius=12)
 
         now = time.localtime()
         time_str = time.strftime("%H:%M:%S", now)
         date_str = time.strftime("%A, %B %d %Y", now)
 
-        time_surf = self.font_clock.render(time_str, True, C_ACCENT2)
+        title = self.font_small.render("ASM Intercity Rail", True, C_TEXT_DIM)
+        time_surf = self.font_clock.render(time_str, True, C_TEXT)
         date_surf = self.font_small.render(date_str, True, C_TEXT_DIM)
 
-        self.screen.blit(time_surf, (r.left + 12, r.top + 8))
-        self.screen.blit(date_surf, (r.left + 12, r.top + 38))
+        self.screen.blit(title, (r.left + 12, r.top + 7))
+        self.screen.blit(time_surf, (r.left + 12, r.top + 20))
+        self.screen.blit(date_surf, (r.left + 170, r.top + 49))
 
-        # location label
-        loc = self.font_small.render(f"Frederick, MD  ·  {MAP_RADIUS_MILES} mi radius", True, C_TEXT_DIM)
-        self.screen.blit(loc, (r.right - loc.get_width() - 10, r.top + 8))
+        loc = self.font_small.render(f"Frederick area · {MAP_RADIUS_MILES} mi", True, C_TEXT_DIM)
+        self.screen.blit(loc, (r.right - loc.get_width() - 12, r.top + 10))
 
-        # connection status
         if self._last_data_update:
             age = time.time() - self._last_data_update
             if age < 120:
-                status = self.font_small.render("● LIVE", True, (80, 255, 100))
+                status = self.font_small.render("● Live", True, (104, 235, 138))
             else:
-                status = self.font_small.render("● STALE", True, C_ACCENT2)
+                status = self.font_small.render("● Stale", True, C_ACCENT2)
         else:
-            status = self.font_small.render("○ LOADING", True, C_TEXT_DIM)
-        self.screen.blit(status, (r.right - status.get_width() - 10, r.top + 26))
+            status = self.font_small.render("○ Loading", True, C_TEXT_DIM)
+        self.screen.blit(status, (r.right - status.get_width() - 12, r.top + 31))
+
+    def _render_footer_hint(self):
+        text = self.font_small.render("Data: asm.transitdocs.com", True, (132, 146, 164))
+        self.screen.blit(text, (PANEL_GAP, self.screen_h - text.get_height() - 8))
 
     def run(self):
         running = True
@@ -1651,29 +1561,28 @@ class TrainStationApp:
                 self._schedule_data_update()
                 last_update_check = now
 
-            # update MOTD rotation
-            self.motd_panel.update()
-
             # render
             self.screen.fill(C_BG)
 
             with self._data_lock:
                 trains = self._amtrak_trains
+                infrastructure = self._infrastructure
 
             self.map_renderer.render(
-                self.screen, {}, trains,
+                self.screen, infrastructure, trains,
                 self.font_body, self.font_small,
                 self.map_rect.topleft
             )
 
             self._render_header()
+            self._render_footer_hint()
 
             self.schedule_panel.render(
                 self.screen, self.font_title, self.font_body, self.font_small
             )
-
+            self.motd_panel.update()
             self.motd_panel.render(
-                self.screen, self.font_title, self.font_fact
+                self.screen, self.font_title, self.font_small
             )
 
             pygame.display.flip()
