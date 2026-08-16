@@ -1,0 +1,5 @@
+[Desktop Entry]
+Type=Application
+Name=Train Station
+Exec=/home/pi/train-station/launch.sh
+X-GNOME-Autostart-enabled=true

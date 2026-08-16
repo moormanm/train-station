@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+
+
+# Hide mouse cursor immediately
+unclutter -idle 0 &
+
+# Disable all X11 screen blanking / DPMS
+xset s off
+xset s noblank
+xset -dpms
+
+# Wayfire / labwc (Bookworm Wayland) — belt-and-suspenders
+if command -v wlr-randr &>/dev/null; then
+    wlr-randr --output HDMI-A-1 --on 2>/dev/null || true
+fi
+
+cd "/home/pi/train-station"
+
+# get latest
+git pull origin main
+
+exec /usr/bin/python3 -u "/home/pi/train-station/train_station.py" > "/home/pi/train_station.log" 2>&1
