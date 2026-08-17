@@ -272,6 +272,11 @@ class MapTileOverlay:
                     while len(self._cache) > self.max_tiles:
                         self._cache.popitem(last=False)
 
+    def get_stats(self) -> tuple[int, int]:
+        """Return (cached_tiles, pending_tiles) for render throttling."""
+        with self._lock:
+            return len(self._cache), len(self._pending)
+
 
 class TransitDocsClient:
     """Transitdocs-only data client for trains, stations, schedules, and rail overlay."""
@@ -893,13 +898,94 @@ class MapRenderer:
         self.tiles_y = tiles_y + 2
 
         self._surface = pygame.Surface((width, height))
+        self._static_surface = pygame.Surface((width, height))
         self._tone_overlay = pygame.Surface((width, height), pygame.SRCALPHA)
         self._tone_overlay.fill((0, 0, 0, 55))
+        self._total_tiles = self.tiles_x * self.tiles_y
+        self._tiles_drawn_last = 0
+        self._static_cache_key = None
+        self._last_static_refresh = 0.0
+        self._tile_refresh_interval_sec = 0.5
 
         self._station_label_cache: dict[str, pygame.Surface] = {}
         self._num_font_small = pygame.font.Font(None, 15)
         self._num_font_large = pygame.font.Font(None, 18)
         self._train_num_cache: dict[tuple[str, int], tuple[pygame.Surface, pygame.Surface]] = {}
+
+    def _render_static_layer(self, infrastructure: dict, font_small: pygame.font.Font):
+        """Render static map parts: tiles, infrastructure, and fixed markers."""
+        self._static_surface.fill(C_BG)
+
+        tile_drawn = 0
+        for dx in range(self.tiles_x):
+            for dy in range(self.tiles_y):
+                tx = self.origin_tile_x + dx
+                ty = self.origin_tile_y + dy
+                px = int(self._cx_px + (tx - self._origin_ftx) * TILE_SIZE)
+                py = int(self._cy_px + (ty - self._origin_fty) * TILE_SIZE)
+                tile = self.tile_overlay.get(self.zoom, tx, ty)
+                if tile is not None:
+                    self._static_surface.blit(tile, (px, py))
+                    tile_drawn += 1
+                else:
+                    pygame.draw.rect(self._static_surface, (16, 22, 32), pygame.Rect(px, py, TILE_SIZE, TILE_SIZE))
+
+        if tile_drawn == 0:
+            grid_color = (20, 28, 40)
+            for gx in range(0, self.width, 64):
+                pygame.draw.line(self._static_surface, grid_color, (gx, 0), (gx, self.height), 1)
+            for gy in range(0, self.height, 64):
+                pygame.draw.line(self._static_surface, grid_color, (0, gy), (self.width, gy), 1)
+
+        self._tiles_drawn_last = tile_drawn
+        self._static_surface.blit(self._tone_overlay, (0, 0))
+
+        tracks = (infrastructure or {}).get("tracks", [])
+        for tr in tracks:
+            pts = tr.get("points", [])
+            if len(pts) < 2:
+                continue
+            px_pts = []
+            for lat, lon in pts:
+                px, py = self._latlon_to_px(lat, lon)
+                if -128 <= px <= self.width + 128 and -128 <= py <= self.height + 128:
+                    px_pts.append((px, py))
+            if len(px_pts) < 2:
+                continue
+            try:
+                pygame.draw.lines(self._static_surface, (22, 28, 38), False, px_pts, 5)
+                pygame.draw.lines(self._static_surface, (133, 158, 188), False, px_pts, 2)
+            except Exception:
+                continue
+
+        for st in (infrastructure or {}).get("stations", []):
+            slat = st.get("lat")
+            slon = st.get("lon")
+            sname = st.get("name", "")
+            if slat is None or slon is None:
+                continue
+            px, py = self._latlon_to_px(slat, slon)
+            if -10 <= px < self.width + 10 and -10 <= py < self.height + 10:
+                pygame.draw.circle(self._static_surface, C_STATION_DOT, (px, py), 5)
+                pygame.draw.circle(self._static_surface, C_TEXT, (px, py), 5, 1)
+                lbl = self._station_label_cache.get(sname)
+                if lbl is None:
+                    lbl = font_small.render(sname, True, C_TEXT)
+                    self._station_label_cache[sname] = lbl
+                self._static_surface.blit(lbl, (px + 7, py - 6))
+
+        ox, oy = self._latlon_to_px(ORIGIN_LAT, ORIGIN_LON)
+        pygame.draw.circle(self._static_surface, C_ACCENT, (ox, oy), 8, 2)
+        pygame.draw.line(self._static_surface, C_ACCENT, (ox - 14, oy), (ox + 14, oy), 1)
+        pygame.draw.line(self._static_surface, C_ACCENT, (ox, oy - 14), (ox, oy + 14), 1)
+
+        edge_px, _ = self._latlon_to_px(ORIGIN_LAT, ORIGIN_LON + MAP_RADIUS_MILES / (
+            69.0 * math.cos(math.radians(ORIGIN_LAT))))
+        radius_px = abs(edge_px - ox)
+        if radius_px > 10:
+            pygame.draw.circle(self._static_surface, C_PANEL_BORDER, (ox, oy), radius_px, 1)
+
+        self._last_static_refresh = time.time()
 
     def _latlon_to_px(self, lat, lon):
         """Convert lat/lon to pixel coordinates on the map surface."""
@@ -937,68 +1023,23 @@ class MapRenderer:
                font_label: pygame.font.Font, font_small: pygame.font.Font,
                dest_xy: tuple[int, int] = (0, 0)):
         """Draw map onto the provided surface."""
-        self._surface.fill(C_BG)
-
-        # draw dark tile overlay (non-blocking; fallback draws subtle grid while loading)
-        tile_drawn = False
-        for dx in range(self.tiles_x):
-            for dy in range(self.tiles_y):
-                tx = self.origin_tile_x + dx
-                ty = self.origin_tile_y + dy
-                px = int(self._cx_px + (tx - self._origin_ftx) * TILE_SIZE)
-                py = int(self._cy_px + (ty - self._origin_fty) * TILE_SIZE)
-                tile = self.tile_overlay.get(self.zoom, tx, ty)
-                if tile is not None:
-                    self._surface.blit(tile, (px, py))
-                    tile_drawn = True
-                else:
-                    pygame.draw.rect(self._surface, (16, 22, 32), pygame.Rect(px, py, TILE_SIZE, TILE_SIZE))
-
-        if not tile_drawn:
-            grid_color = (20, 28, 40)
-            for gx in range(0, self.width, 64):
-                pygame.draw.line(self._surface, grid_color, (gx, 0), (gx, self.height), 1)
-            for gy in range(0, self.height, 64):
-                pygame.draw.line(self._surface, grid_color, (0, gy), (self.width, gy), 1)
-
-        # keep the theme subdued to match prior appearance
-        self._surface.blit(self._tone_overlay, (0, 0))
-
-        # draw rail infrastructure lines (ASM-style visible track overlay)
         tracks = (infrastructure or {}).get("tracks", [])
-        for tr in tracks:
-            pts = tr.get("points", [])
-            if len(pts) < 2:
-                continue
-            px_pts = []
-            for lat, lon in pts:
-                px, py = self._latlon_to_px(lat, lon)
-                if -128 <= px <= self.width + 128 and -128 <= py <= self.height + 128:
-                    px_pts.append((px, py))
-            if len(px_pts) < 2:
-                continue
-            try:
-                pygame.draw.lines(self._surface, (22, 28, 38), False, px_pts, 5)
-                pygame.draw.lines(self._surface, (133, 158, 188), False, px_pts, 2)
-            except Exception:
-                continue
+        stations = (infrastructure or {}).get("stations", [])
+        static_key = (len(tracks), len(stations), font_small.get_height())
 
-        # draw station markers from Transitdocs stationInfo
-        for st in (infrastructure or {}).get("stations", []):
-            slat = st.get("lat")
-            slon = st.get("lon")
-            sname = st.get("name", "")
-            if slat is None or slon is None:
-                continue
-            px, py = self._latlon_to_px(slat, slon)
-            if -10 <= px < self.width + 10 and -10 <= py < self.height + 10:
-                pygame.draw.circle(self._surface, C_STATION_DOT, (px, py), 5)
-                pygame.draw.circle(self._surface, C_TEXT, (px, py), 5, 1)
-                lbl = self._station_label_cache.get(sname)
-                if lbl is None:
-                    lbl = font_small.render(sname, True, C_TEXT)
-                    self._station_label_cache[sname] = lbl
-                self._surface.blit(lbl, (px + 7, py - 6))
+        now = time.time()
+        needs_static_refresh = (self._static_cache_key != static_key)
+        if not needs_static_refresh:
+            _, pending_tiles = self.tile_overlay.get_stats()
+            tile_incomplete = self._tiles_drawn_last < self._total_tiles
+            if (pending_tiles > 0 or tile_incomplete) and (now - self._last_static_refresh) >= self._tile_refresh_interval_sec:
+                needs_static_refresh = True
+
+        if needs_static_refresh:
+            self._render_static_layer(infrastructure, font_small)
+            self._static_cache_key = static_key
+
+        self._surface.blit(self._static_surface, (0, 0))
 
         # ── draw live Amtrak train positions ──────────────────────────
         for train in trains:
@@ -1067,20 +1108,6 @@ class MapRenderer:
                     self._surface.blit(num_dark, (tx + odx, ty + ody))
                 self._surface.blit(num_surf, (tx, ty))
 
-        # draw origin crosshair
-        ox, oy = self._latlon_to_px(ORIGIN_LAT, ORIGIN_LON)
-        pygame.draw.circle(self._surface, C_ACCENT, (ox, oy), 8, 2)
-        pygame.draw.line(self._surface, C_ACCENT, (ox - 14, oy), (ox + 14, oy), 1)
-        pygame.draw.line(self._surface, C_ACCENT, (ox, oy - 14), (ox, oy + 14), 1)
-
-        # draw bounding radius ring (dashed-ish)
-        d_lat = MAP_RADIUS_MILES / 69.0
-        edge_px, _ = self._latlon_to_px(ORIGIN_LAT, ORIGIN_LON + MAP_RADIUS_MILES / (
-            69.0 * math.cos(math.radians(ORIGIN_LAT))))
-        radius_px = abs(edge_px - ox)
-        if radius_px > 10:
-            pygame.draw.circle(self._surface, C_PANEL_BORDER, (ox, oy), radius_px, 1)
-
         surface.blit(self._surface, dest_xy)
 
 # ═══════════════════════════════════════════════════════════════════
@@ -1095,7 +1122,6 @@ class SchedulePanel:
         self._entries = []       # list of schedule entry dicts from TransitDocsClient
         self._last_update = 0
         self._page_started = time.time()
-        self._page_train_sprite = _load_whimsical_train_sprite(target_h=32)
         self._base_panel = None
         self._rows_surface = None
         self._rows_cache_key = None
@@ -1272,12 +1298,7 @@ class SchedulePanel:
                 progress_x = track_l + int((track_r - track_l) * (1.0 - frac))
                 pygame.draw.line(surface, C_SEPARATOR, (track_l, track_y), (track_r, track_y), 2)
                 pygame.draw.line(surface, C_ACCENT, (track_l, track_y), (progress_x, track_y), 3)
-                if self._page_train_sprite is not None:
-                    sx = progress_x - (self._page_train_sprite.get_width() // 2)
-                    sy = track_y - self._page_train_sprite.get_height() + 1
-                    surface.blit(self._page_train_sprite, (sx, sy))
-                else:
-                    pygame.draw.circle(surface, C_ACCENT2, (progress_x, track_y), 4)
+                pygame.draw.circle(surface, C_ACCENT2, (progress_x, track_y), 4)
 
         else:
             msg = font_body.render("Loading live train cards…", True, C_TEXT_DIM)
