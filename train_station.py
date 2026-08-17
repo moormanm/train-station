@@ -23,6 +23,8 @@ SCHEDULE_UPDATE_SEC = 30    # how often to refresh schedules
 MOTD_ROTATE_SEC = 30        # how often to cycle train fact
 SCHEDULE_PAGE_ROTATE_SEC = 10  # how often to flip Train Information pages
 PROGRESS_UPDATE_HZ = 10         # animate progress train 5 times per second
+SELF_UPDATE_INTERVAL_S = 5 * 60
+SELF_UPDATE_TIMEOUT_S = 120
 
 MAP_PANEL_W = int(SCREEN_W * 0.70)   # 1344 px
 SIDE_PANEL_W = SCREEN_W - MAP_PANEL_W  # 576 px
@@ -62,6 +64,7 @@ import random
 import json
 import threading
 import io
+import subprocess
 from datetime import datetime, timezone, timedelta
 from collections import OrderedDict
 
@@ -219,6 +222,75 @@ def _load_whimsical_train_sprite(target_h: int = 32):
     except Exception:
         _log_http("GET", PAGE_TRAIN_GIF_URL, "error")
         return None
+
+def _git_head(repo_dir: str):
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=True,
+        )
+        return proc.stdout.strip()
+    except Exception as e:
+        print(f"Self-update: git rev-parse failed: {e}", flush=True)
+        return None
+
+def _maybe_self_update_and_restart(repo_dir: str) -> bool:
+    if not os.path.isdir(os.path.join(repo_dir, ".git")):
+        return False
+
+    before = _git_head(repo_dir)
+    print("Self-update: running git pull", flush=True)
+    try:
+        pull = subprocess.run(
+            ["git", "pull"],
+            cwd=repo_dir,
+            capture_output=True,
+            text=True,
+            timeout=SELF_UPDATE_TIMEOUT_S,
+        )
+    except Exception as e:
+        print(f"Self-update: git pull failed: {e}", flush=True)
+        return False
+
+    stdout = (pull.stdout or "").strip()
+    stderr = (pull.stderr or "").strip()
+    if stdout:
+        print(f"Self-update git pull stdout: {stdout}", flush=True)
+    if stderr:
+        print(f"Self-update git pull stderr: {stderr}", flush=True)
+    if pull.returncode != 0:
+        print(f"Self-update: git pull exited with status {pull.returncode}", flush=True)
+        return False
+
+    after = _git_head(repo_dir)
+    combined = f"{stdout}\n{stderr}"
+    already_up_to_date = (
+        "Already up to date." in combined
+        or "Already up-to-date." in combined
+    )
+    if before and after:
+        updated = before != after
+    else:
+        updated = not already_up_to_date
+
+    if not updated:
+        print("Self-update: no remote updates found", flush=True)
+        return False
+
+    script_path = os.path.abspath(__file__)
+    print("Self-update: updates found, launching fresh process", flush=True)
+    try:
+        env = os.environ.copy()
+        env["PYTHONUNBUFFERED"] = "1"
+        subprocess.Popen([sys.executable, "-u", script_path], cwd=repo_dir, env=env)
+        return True
+    except Exception as e:
+        print(f"Self-update: failed to launch fresh process: {e}", flush=True)
+        return False
 
 # ═══════════════════════════════════════════════════════════════════
 # SECTION 5: TRANSITDOCS CLIENT
@@ -1512,6 +1584,8 @@ class TrainStationApp:
 
         pygame.mouse.set_visible(False)
         self.clock = pygame.time.Clock()
+        self._repo_dir = os.path.dirname(os.path.abspath(__file__))
+        self._next_self_update_check = time.time() + SELF_UPDATE_INTERVAL_S
 
         # fonts
         self._init_fonts()
@@ -1642,6 +1716,12 @@ class TrainStationApp:
                         running = False
 
             now = time.time()
+
+            if now >= self._next_self_update_check:
+                self._next_self_update_check = now + SELF_UPDATE_INTERVAL_S
+                if _maybe_self_update_and_restart(self._repo_dir):
+                    pygame.quit()
+                    sys.exit(0)
 
             # schedule periodic data refresh
             if now - last_update_check >= TRAIN_UPDATE_SEC:
