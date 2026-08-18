@@ -403,6 +403,35 @@ class TransitDocsClient:
         except (TypeError, ValueError, OSError):
             return None
 
+    def _stop_est_dt(self, stop: dict, prefer: str = "depart") -> "datetime | None":
+        """
+        Return the estimated datetime for a stop, combining sched timestamp + variance.
+        prefer='depart' tries depart first, then arrive; 'arrive' is the reverse.
+        """
+        if prefer == "depart":
+            timing_keys = [("depart", "sched_depart"), ("arrive", "sched_arrive")]
+        else:
+            timing_keys = [("arrive", "sched_arrive"), ("depart", "sched_depart")]
+        for t_key, s_key in timing_keys:
+            timing = stop.get(t_key)
+            sched_ts = stop.get(s_key)
+            if not isinstance(timing, dict) or sched_ts is None:
+                continue
+            variance = timing.get("variance") or 0
+            try:
+                return datetime.fromtimestamp(float(sched_ts) + float(variance), tz=timezone.utc)
+            except (TypeError, ValueError, OSError):
+                continue
+        return None
+
+    def _stop_delay_min(self, stop: dict) -> int:
+        """Return delay in minutes from the most relevant timing object."""
+        for key in ("depart", "arrive"):
+            timing = stop.get(key)
+            if isinstance(timing, dict):
+                return int((timing.get("variance") or 0) / 60)
+        return 0
+
     def _bearing_to_heading(self, bearing: float) -> str:
         dirs = ("N", "NE", "E", "SE", "S", "SW", "W", "NW")
         idx = int((float(bearing) % 360.0) / 45.0 + 0.5) % len(dirs)
@@ -479,6 +508,7 @@ class TransitDocsClient:
                 "iconColor": self.PROVIDER_COLORS.get(railroad, "#e8a020"),
                 "origin_code": str(raw.get("origin") or "").upper(),
                 "destination_code": str(raw.get("destination") or "").upper(),
+                "total_miles": int(raw.get("total_miles") or 0),
                 "stops": stops,
             }
             trains.append(train)
@@ -559,8 +589,8 @@ class TransitDocsClient:
         for stop in train.get("stops", []):
             if stop.get("canceled"):
                 continue
-            pred = self._to_dt(stop.get("depart") or stop.get("arrive"))
-            if pred and pred >= now_utc - timedelta(minutes=2):
+            est = self._stop_est_dt(stop)
+            if est and est >= now_utc - timedelta(minutes=2):
                 code = str(stop.get("code") or "").strip().upper()
                 return self._stop_name(station_by_code, code)
         return "—"
@@ -586,7 +616,7 @@ class TransitDocsClient:
             return "Canceled"
         if pred_dt < now_utc - timedelta(minutes=2):
             return "Departed"
-        delay_min = int((pred_dt - sch_dt).total_seconds() / 60)
+        delay_min = self._stop_delay_min(stop)
         if delay_min > 2:
             return "Late"
         if delay_min < -2:
@@ -616,19 +646,18 @@ class TransitDocsClient:
                 if stop.get("canceled"):
                     continue
                 code = str(stop.get("code") or "").strip().upper()
-                pred_dt = self._to_dt(stop.get("depart") or stop.get("arrive"))
-                sch_dt = self._to_dt(stop.get("sched_depart") or stop.get("sched_arrive"))
+                pred_dt = self._stop_est_dt(stop)
                 if pred_dt is None:
                     continue
-                if sch_dt is None:
-                    sch_dt = pred_dt
                 if pred_dt < now_utc - timedelta(minutes=2):
                     continue
 
-                delay_min = int((pred_dt - sch_dt).total_seconds() / 60)
-                status = self._stop_status(stop, pred_dt, sch_dt, now_utc)
+                delay_min = self._stop_delay_min(stop)
+                status = self._stop_status(stop, pred_dt, pred_dt, now_utc)
                 dist = self._station_distance(station_by_code, code, train_dist)
                 station_name = self._stop_name(station_by_code, code)
+                sched_ts = stop.get("sched_depart") or stop.get("sched_arrive")
+                sch_dt = self._to_dt(sched_ts) if sched_ts else pred_dt
 
                 candidate = {
                     "train_num": num,
@@ -642,10 +671,12 @@ class TransitDocsClient:
                     "dist_miles": dist,
                     "train_lat": train["lat"],
                     "train_lon": train["lon"],
+                    "origin_code": train.get("origin_code", ""),
                     "destination": destination,
                     "next_stop": next_stop,
                     "direction": direction,
                     "speed_mph": speed_mph,
+                    "total_miles": train.get("total_miles", 0),
                 }
                 if best_entry is None or (candidate["est_dep"], candidate["dist_miles"]) < (
                     best_entry["est_dep"], best_entry["dist_miles"]
@@ -658,21 +689,23 @@ class TransitDocsClient:
                     "route_name": route,
                     "station_name": next_stop if next_stop != "—" else destination,
                     "station_code": "",
-                    "sch_dep": now_utc + timedelta(days=7),
-                    "est_dep": now_utc + timedelta(days=7),
+                    "sch_dep": None,
+                    "est_dep": None,
                     "status": "Enroute",
                     "delay_min": 0,
                     "dist_miles": train_dist,
                     "train_lat": train["lat"],
                     "train_lon": train["lon"],
+                    "origin_code": train.get("origin_code", ""),
                     "destination": destination,
                     "next_stop": next_stop,
                     "direction": direction,
                     "speed_mph": speed_mph,
+                    "total_miles": train.get("total_miles", 0),
                 }
             entries.append(best_entry)
 
-        entries.sort(key=lambda e: e["est_dep"])
+        entries.sort(key=lambda e: (e["est_dep"] is None, e["est_dep"]))
         return entries
 
 
@@ -1241,7 +1274,7 @@ class SchedulePanel:
         y += 8
 
         if self._entries:
-            row_h = 64
+            row_h = 52
             footer_h = 30
             available_h = max(0, (r.bottom - footer_h) - y)
             rows_per_page = max(1, available_h // row_h)
@@ -1255,63 +1288,42 @@ class SchedulePanel:
                 (
                     str(e.get("train_num", "?")),
                     str(e.get("route_name", "")),
-                    str(e.get("station_name", "")),
+                    str(e.get("origin_code", "")),
+                    str(e.get("destination", "?")),
                     str(e.get("status", "")),
                     int(e.get("delay_min", 0)),
                     str(e.get("direction", "?")),
                     int(float(e.get("speed_mph") or 0.0)),
-                    str(e.get("destination", "?")),
-                    str(e.get("next_stop", "—")),
-                    e.get("sch_dep"),
-                    e.get("est_dep"),
                 )
                 for e in page_entries
             )
-            rows_cache_key = (page_idx, rows_per_page, now_tick, row_signature)
+            rows_cache_key = (page_idx, rows_per_page, row_signature)
 
             if self._cache_dirty or self._rows_cache_key != rows_cache_key or self._rows_surface is None:
                 rows_surface = pygame.Surface((r.width, r.height), pygame.SRCALPHA)
                 row_y = y
                 for entry in page_entries:
-                    num        = str(entry.get("train_num", "?"))
-                    route      = entry.get("route_name", "")
-                    stn        = entry.get("station_name", "?")[:16]
-                    est        = entry.get("est_dep")
-                    sch        = entry.get("sch_dep")
-                    status     = entry.get("status", "")
-                    delay      = entry.get("delay_min", 0)
+                    num         = str(entry.get("train_num", "?"))
+                    route       = entry.get("route_name", "")
+                    origin_code = str(entry.get("origin_code", "") or "")
                     destination = str(entry.get("destination", "?"))
-                    next_stop   = str(entry.get("next_stop", "—"))
+                    status      = entry.get("status", "")
+                    delay       = entry.get("delay_min", 0)
                     direction   = str(entry.get("direction", "?"))
                     speed_mph   = float(entry.get("speed_mph") or 0.0)
 
-                    try:
-                        time_str = sch.astimezone().strftime("%H:%M")
-                    except Exception:
-                        time_str = "--:--"
-
-                    try:
-                        mins = int((est - now_utc).total_seconds() / 60)
-                        eta = "NOW" if mins <= 0 else f"{mins}m"
-                    except Exception:
-                        eta = "--"
-
-                    card = pygame.Rect(x - r.left, row_y - r.top, content_w, 58)
+                    card = pygame.Rect(x - r.left, row_y - r.top, content_w, 46)
                     pygame.draw.rect(rows_surface, (20, 27, 37), card, border_radius=8)
                     pygame.draw.rect(rows_surface, (50, 67, 88), card, 1, border_radius=8)
 
-                    row1 = font_body.render(f"#{num}  {route[:16]}", True, C_TEXT)
+                    row1 = font_body.render(f"#{num}  {route[:20]}", True, C_TEXT)
+                    route_str = f"{origin_code} → {destination[:18]}" if origin_code else f"→ {destination[:20]}"
                     row2 = font_small.render(
-                        f"{stn} • ETA {eta} • {direction} {speed_mph:.0f} mph",
+                        f"{route_str}  •  {speed_mph:.0f} mph {direction}",
                         True, C_TEXT_DIM
                     )
-                    row3 = font_small.render(
-                        f"to {destination[:16]} • next {next_stop[:14]} • {time_str}",
-                        True, C_TEXT_DIM
-                    )
-                    rows_surface.blit(row1, (card.left + 10, card.top + 6))
-                    rows_surface.blit(row2, (card.left + 10, card.top + 25))
-                    rows_surface.blit(row3, (card.left + 10, card.top + 41))
+                    rows_surface.blit(row1, (card.left + 10, card.top + 5))
+                    rows_surface.blit(row2, (card.left + 10, card.top + 27))
 
                     if status == "Departed":
                         chip_bg = (66, 76, 90)
@@ -1329,24 +1341,20 @@ class SchedulePanel:
                         chip_bg = (32, 96, 62)
                         chip_fg = (220, 249, 230)
 
-                    delay_tag = ""
-                    if delay > 2:
-                        delay_tag = f"+{delay}m"
-                    elif delay < -2:
-                        delay_tag = f"{delay}m"
+                    delay_tag = f"+{delay}m" if delay > 2 else (f"{delay}m" if delay < -2 else "")
                     chip_text = ((status or "On Time") + (" " + delay_tag if delay_tag else "")).strip()[:14]
                     chip = font_small.render(chip_text, True, chip_fg)
                     chip_pad_x = 8
                     chip_pad_y = 3
                     chip_rect = pygame.Rect(
                         card.right - chip.get_width() - (chip_pad_x * 2) - 8,
-                        card.top + 7,
+                        card.top + 6,
                         chip.get_width() + (chip_pad_x * 2),
                         chip.get_height() + (chip_pad_y * 2),
                     )
                     pygame.draw.rect(rows_surface, chip_bg, chip_rect, border_radius=10)
                     rows_surface.blit(chip, (chip_rect.left + chip_pad_x, chip_rect.top + chip_pad_y))
-                    row_y += 64
+                    row_y += 52
 
                 self._rows_surface = rows_surface
                 self._rows_cache_key = rows_cache_key
@@ -1547,9 +1555,15 @@ class MotdPanel:
         pygame.draw.line(surface, C_SEPARATOR, (track_l, track_y), (track_r, track_y), 2)
         pygame.draw.line(surface, C_ACCENT, (track_l, track_y), (progress_x, track_y), 3)
         if self._scroll_train_sprite is not None:
-            sx = progress_x - (self._scroll_train_sprite.get_width() // 2)
+            sw = self._scroll_train_sprite.get_width()
+            sx = progress_x - (sw // 2)
             sy = track_y - self._scroll_train_sprite.get_height() + 1
+            # clip the blit to the panel rect so the sprite never bleeds outside
+            clip_rect = pygame.Rect(r.left, r.top, r.width, r.height)
+            old_clip = surface.get_clip()
+            surface.set_clip(clip_rect)
             surface.blit(self._scroll_train_sprite, (sx, sy))
+            surface.set_clip(old_clip)
         else:
             pygame.draw.circle(surface, C_ACCENT2, (progress_x, track_y), 4)
 
