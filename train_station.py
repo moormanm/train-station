@@ -14,8 +14,8 @@ ORIGIN_LON = -77.4105
 MAP_RADIUS_MILES = 200      # radius around origin to display
 SCHEDULE_RADIUS_MILES = 50  # nearby stations to show in schedule panel
 
-SCREEN_W = 1920
-SCREEN_H = 1080
+SCREEN_W = 1920  # unused — resolution is auto-detected at startup
+SCREEN_H = 1080  # unused — resolution is auto-detected at startup
 FPS_CAP = 20
 
 TRAIN_UPDATE_SEC = 30       # how often to refresh train positions
@@ -1577,11 +1577,12 @@ class TrainStationApp:
         pygame.init()
         pygame.display.set_caption("Train Station")
 
+        info = pygame.display.Info()
+        if info.current_w <= 0 or info.current_h <= 0:
+            raise RuntimeError(f"Could not detect display resolution (got {info.current_w}x{info.current_h})")
+
         flags = pygame.FULLSCREEN | pygame.HWSURFACE | pygame.DOUBLEBUF
-        try:
-            self.screen = pygame.display.set_mode((0, 0), flags)
-        except Exception:
-            self.screen = pygame.display.set_mode((SCREEN_W, SCREEN_H))
+        self.screen = pygame.display.set_mode((0, 0), flags)
         self.screen_w, self.screen_h = self.screen.get_size()
 
         pygame.mouse.set_visible(False)
