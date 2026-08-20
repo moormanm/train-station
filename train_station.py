@@ -1818,7 +1818,23 @@ class TrainStationApp:
         # Between rebuilds it is blitted as-is; no rendering work at all.
         _map_cache = self._map_with_trains   # local alias
 
+        # ── perf profiler ─────────────────────────────────────────────
+        # Accumulates wall-clock time (ms) per named operation and prints
+        # a report every PERF_REPORT_SEC seconds so we can see what's slow.
+        PERF_REPORT_SEC = 10
+        _perf: dict[str, float] = {}
+        _perf_calls: dict[str, int] = {}
+        _perf_last_report = time.time()
+
+        def _pt(label: str, t0: float):
+            """Record elapsed ms since t0 under label."""
+            ms = (time.time() - t0) * 1000
+            _perf[label] = _perf.get(label, 0.0) + ms
+            _perf_calls[label] = _perf_calls.get(label, 0) + 1
+
         while running:
+            _tick_start = time.time()
+
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
                     running = False
@@ -1845,18 +1861,21 @@ class TrainStationApp:
             if self._bg_dirty or tiles_arrived:
                 _static_bg_dirty = True
 
-            # ── LEVEL 1: full static rebuild (infrastructure/tiles changed) ──
+            # ── LEVEL 1: full static rebuild ─────────────────────────
             if _static_bg_dirty:
                 _static_bg.fill(C_BG)
                 with self._data_lock:
                     trains = self._amtrak_trains[:]
                     infrastructure = self._infrastructure
-                # render() rebuilds _static_surface inside map_renderer
+
+                t0 = time.time()
                 self.map_renderer.render(
                     _static_bg, infrastructure, trains,
                     self.font_body, self.font_small,
                     self.map_rect.topleft
                 )
+                _pt("L1:map_render", t0)
+
                 b = self._map_border_px
                 pygame.draw.rect(_static_bg, C_PANEL_BORDER,
                                  pygame.Rect(0, 0, self.map_rect.width, self.map_rect.height), b)
@@ -1866,81 +1885,118 @@ class TrainStationApp:
                         self._footer_surface,
                         (PANEL_GAP, self.screen_h - self._footer_surface.get_height() - 8)
                     )
+
+                t0 = time.time()
                 self.motd_panel.update()
                 self.schedule_panel.render(
                     _static_bg, self.font_title, self.font_body, self.font_small
                 )
                 self.motd_panel.render(_static_bg, self.font_title, self.font_small)
+                _pt("L1:panels", t0)
 
-                # Also rebuild _map_with_trains from the fresh static surface
+                t0 = time.time()
                 self.map_renderer.render_trains_only(_map_cache, trains)
                 b = self._map_border_px
                 pygame.draw.rect(_map_cache, C_PANEL_BORDER,
                                  pygame.Rect(0, 0, self.map_rect.width, self.map_rect.height), b)
+                _pt("L1:trains_only", t0)
                 self._trains_dirty = False
 
+                t0 = time.time()
                 self.screen.blit(_static_bg, (0, 0))
                 self.screen.blit(_map_cache, self.map_rect.topleft)
                 self._render_header()
+                _pt("L1:blit_to_screen", t0)
+
+                t0 = time.time()
+                pygame.display.flip()
+                _pt("L1:display_flip", t0)
+
                 _last_header_draw   = now
                 _last_progress_draw = now
                 _last_schedule_draw = now
-                pygame.display.flip()
                 _static_bg_dirty = False
                 self._bg_dirty = False
+                _pt("tick_total", _tick_start)
                 self.clock.tick(FPS_CAP)
                 continue
 
-            # ── LEVEL 2: train positions changed (every ~30 s) ───────
+            # ── LEVEL 2: train positions changed (~30 s) ─────────────
             if self._trains_dirty:
                 with self._data_lock:
                     trains = self._amtrak_trains[:]
+
+                t0 = time.time()
                 self.map_renderer.render_trains_only(_map_cache, trains)
                 b = self._map_border_px
                 pygame.draw.rect(_map_cache, C_PANEL_BORDER,
                                  pygame.Rect(0, 0, self.map_rect.width, self.map_rect.height), b)
+                _pt("L2:trains_only", t0)
                 self._trains_dirty = False
+
+                t0 = time.time()
                 self.screen.blit(_map_cache, self.map_rect.topleft)
                 self._render_header()
-                _last_header_draw = now
+                _pt("L2:blit_to_screen", t0)
+
+                t0 = time.time()
                 pygame.display.update([self.map_rect, self.header_rect])
+                _pt("L2:display_update", t0)
+
+                _last_header_draw = now
+                _pt("tick_total", _tick_start)
                 self.clock.tick(FPS_CAP)
                 continue
 
-            # ── LEVEL 3: only clock / progress bars need updating ────
+            # ── LEVEL 3: clock / motd animation / schedule ───────────
             dirty_rects: list[pygame.Rect] = []
 
             if now - _last_header_draw >= _HEADER_INTERVAL:
+                t0 = time.time()
                 self._render_header()
+                _pt("L3:header", t0)
                 dirty_rects.append(self.header_rect)
                 _last_header_draw = now
 
-            # motd: redraws at full animation rate — only the small fact panel rect
             if now - _last_progress_draw >= _PROGRESS_INTERVAL:
+                t0 = time.time()
                 self.motd_panel.update()
                 self.screen.blit(_static_bg, self.motd_panel.rect.topleft, self.motd_panel.rect)
                 self.motd_panel.render(self.screen, self.font_title, self.font_small)
+                _pt("L3:motd_render", t0)
                 dirty_rects.append(self.motd_panel.rect)
                 _last_progress_draw = now
 
-            # schedule: pages flip every few seconds, no need to render frequently
             if now - _last_schedule_draw >= _SCHEDULE_INTERVAL:
+                t0 = time.time()
                 sched_r = self.schedule_panel.rect
                 self.screen.blit(_static_bg, sched_r.topleft, sched_r)
                 self.schedule_panel.render(
                     self.screen, self.font_title, self.font_body, self.font_small
                 )
+                _pt("L3:sched_render", t0)
                 dirty_rects.append(sched_r)
                 _last_schedule_draw = now
 
-            # ── LEVEL 4: nothing changed — just sleep ────────────────
             if dirty_rects:
+                t0 = time.time()
                 pygame.display.update(dirty_rects)
+                _pt("L3:display_update", t0)
 
-            self.clock.tick(FPS_CAP)
+            _pt("tick_total", _tick_start)
 
-            if dirty_rects:
-                pygame.display.update(dirty_rects)
+            # ── perf report every N seconds ──────────────────────────
+            if now - _perf_last_report >= PERF_REPORT_SEC:
+                print("\n── Perf report ─────────────────────────────")
+                for k in sorted(_perf):
+                    calls = _perf_calls[k]
+                    total = _perf[k]
+                    avg   = total / calls if calls else 0
+                    print(f"  {k:<30s} {calls:5d} calls  avg {avg:7.2f} ms  total {total:8.1f} ms")
+                print("────────────────────────────────────────────\n")
+                _perf.clear()
+                _perf_calls.clear()
+                _perf_last_report = now
 
             self.clock.tick(FPS_CAP)
 
