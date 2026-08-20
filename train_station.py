@@ -1277,155 +1277,128 @@ class SchedulePanel:
 
     def __init__(self, rect: pygame.Rect):
         self.rect = rect
-        self._entries = []       # list of schedule entry dicts from TransitDocsClient
+        self._entries = []
         self._last_update = 0
         self._page_started = time.time()
-        self._base_panel = None
-        self._rows_surface = None
-        self._rows_cache_key = None
         self._cache_dirty = True
+        # Single cached surface for the entire panel — rebuilt only on page/data change.
+        self._full_surface: pygame.Surface | None = None
+        self._full_cache_key = None
 
     def update(self, entries: list):
-        """entries from TransitDocsClient.get_nearby_schedule()"""
         self._entries = entries[:]
         self._last_update = time.time()
         self._page_started = time.time()
         self._cache_dirty = True
 
-    def _ensure_base_panel(self):
-        r = self.rect
-        if self._base_panel is not None:
-            return
-        panel = pygame.Surface((r.width, r.height), pygame.SRCALPHA)
-        panel.fill((12, 17, 25, 214))
-        pygame.draw.rect(panel, C_PANEL_BORDER, panel.get_rect(), 1, border_radius=12)
-        self._base_panel = panel
-
     def render(self, surface: pygame.Surface, font_title: pygame.font.Font,
                font_body: pygame.font.Font, font_small: pygame.font.Font):
         r = self.rect
-        self._ensure_base_panel()
-        surface.blit(self._base_panel, r.topleft)
-
-        y = r.top + 12
-        x = r.left + 12
-        content_w = r.width - 24
         now_ts = time.time()
-        now_utc = datetime.now(timezone.utc)
-        now_tick = int(now_ts)
 
-        title = font_title.render("Intercity Rail Map", True, C_TEXT)
-        subtitle = font_small.render("Live Trains Nearby", True, C_TEXT_DIM)
-        surface.blit(title, (x, y))
-        y += title.get_height() + 1
-        surface.blit(subtitle, (x, y))
-        y += subtitle.get_height() + 8
-        pygame.draw.line(surface, C_SEPARATOR, (x, y), (x + content_w, y), 1)
+        # Determine current page
+        row_h = 52
+        footer_h = 30
+        y_content_start = r.top + 12 + font_title.get_height() + 1 + font_small.get_height() + 16
+        available_h = max(0, (r.bottom - footer_h) - y_content_start)
+        rows_per_page = max(1, available_h // row_h)
+        total_pages   = max(1, math.ceil(len(self._entries) / rows_per_page)) if self._entries else 1
+        elapsed       = max(0.0, now_ts - self._page_started)
+        page_idx      = int(elapsed / SCHEDULE_PAGE_ROTATE_SEC) % total_pages
+        page_start    = page_idx * rows_per_page
+        page_entries  = self._entries[page_start:page_start + rows_per_page]
+
+        # Update minute (not second) so the timestamp doesn't bust the cache every tick
+        update_minute = int(self._last_update // 60) if self._last_update else 0
+
+        row_sig = tuple(
+            (str(e.get("train_num")), str(e.get("route_name")), str(e.get("origin_code")),
+             str(e.get("destination")), str(e.get("status")), int(e.get("delay_min", 0)),
+             str(e.get("direction")), int(float(e.get("speed_mph") or 0)))
+            for e in page_entries
+        )
+        cache_key = (page_idx, rows_per_page, row_sig, update_minute, bool(self._entries))
+
+        if self._cache_dirty or self._full_cache_key != cache_key or self._full_surface is None:
+            self._full_surface = self._build_surface(
+                r, page_entries, page_idx, total_pages,
+                font_title, font_body, font_small
+            )
+            self._full_cache_key = cache_key
+            self._cache_dirty = False
+
+        surface.blit(self._full_surface, r.topleft)
+
+    def _build_surface(self, r, page_entries, page_idx, total_pages,
+                       font_title, font_body, font_small):
+        """Build the full panel surface. Called only on data/page changes."""
+        surf = pygame.Surface((r.width, r.height), pygame.SRCALPHA)
+        surf.fill((12, 17, 25, 214))
+        pygame.draw.rect(surf, C_PANEL_BORDER, surf.get_rect(), 1, border_radius=12)
+
+        x = 12
+        y = 12
+        content_w = r.width - 24
+
+        title_s    = font_title.render("Intercity Rail Map", True, C_TEXT)
+        subtitle_s = font_small.render("Live Trains Nearby", True, C_TEXT_DIM)
+        surf.blit(title_s, (x, y));    y += title_s.get_height() + 1
+        surf.blit(subtitle_s, (x, y)); y += subtitle_s.get_height() + 8
+        pygame.draw.line(surf, C_SEPARATOR, (x, y), (x + content_w, y), 1)
         y += 8
 
-        if self._entries:
-            row_h = 52
-            footer_h = 30
-            available_h = max(0, (r.bottom - footer_h) - y)
-            rows_per_page = max(1, available_h // row_h)
-            total_pages = max(1, math.ceil(len(self._entries) / rows_per_page))
-            elapsed = max(0.0, now_ts - self._page_started)
-            page_idx = int(elapsed / SCHEDULE_PAGE_ROTATE_SEC) % total_pages
-            page_start = page_idx * rows_per_page
-            page_entries = self._entries[page_start:page_start + rows_per_page]
+        if page_entries:
+            for entry in page_entries:
+                num         = str(entry.get("train_num", "?"))
+                route       = entry.get("route_name", "")
+                origin_code = str(entry.get("origin_code", "") or "")
+                destination = str(entry.get("destination", "?"))
+                status      = entry.get("status", "")
+                delay       = entry.get("delay_min", 0)
+                direction   = str(entry.get("direction", "?"))
+                speed_mph   = float(entry.get("speed_mph") or 0.0)
 
-            row_signature = tuple(
-                (
-                    str(e.get("train_num", "?")),
-                    str(e.get("route_name", "")),
-                    str(e.get("origin_code", "")),
-                    str(e.get("destination", "?")),
-                    str(e.get("status", "")),
-                    int(e.get("delay_min", 0)),
-                    str(e.get("direction", "?")),
-                    int(float(e.get("speed_mph") or 0.0)),
+                card = pygame.Rect(x, y, content_w, 46)
+                pygame.draw.rect(surf, (20, 27, 37), card, border_radius=8)
+                pygame.draw.rect(surf, (50, 67, 88), card, 1, border_radius=8)
+
+                row1 = font_body.render(f"#{num}  {route[:20]}", True, C_TEXT)
+                route_str = f"{origin_code} → {destination[:18]}" if origin_code else f"→ {destination[:20]}"
+                row2 = font_small.render(f"{route_str}  •  {speed_mph:.0f} mph {direction}", True, C_TEXT_DIM)
+                surf.blit(row1, (card.left + 10, card.top + 5))
+                surf.blit(row2, (card.left + 10, card.top + 27))
+
+                if status == "Departed":   chip_bg, chip_fg = (66, 76, 90),   (214, 221, 230)
+                elif delay > 15:           chip_bg, chip_fg = (145, 49, 49),  (255, 234, 234)
+                elif delay > 5:            chip_bg, chip_fg = (122, 85, 20),  (255, 233, 188)
+                elif delay < -2:           chip_bg, chip_fg = (25, 92, 69),   (212, 252, 237)
+                else:                      chip_bg, chip_fg = (32, 96, 62),   (220, 249, 230)
+
+                delay_tag = f"+{delay}m" if delay > 2 else (f"{delay}m" if delay < -2 else "")
+                chip_text = ((status or "On Time") + (" " + delay_tag if delay_tag else "")).strip()[:14]
+                chip_s = font_small.render(chip_text, True, chip_fg)
+                cp_x, cp_y = 8, 3
+                chip_rect = pygame.Rect(
+                    card.right - chip_s.get_width() - cp_x * 2 - 8, card.top + 6,
+                    chip_s.get_width() + cp_x * 2, chip_s.get_height() + cp_y * 2,
                 )
-                for e in page_entries
-            )
-            rows_cache_key = (page_idx, rows_per_page, row_signature)
-
-            if self._cache_dirty or self._rows_cache_key != rows_cache_key or self._rows_surface is None:
-                rows_surface = pygame.Surface((r.width, r.height), pygame.SRCALPHA)
-                row_y = y
-                for entry in page_entries:
-                    num         = str(entry.get("train_num", "?"))
-                    route       = entry.get("route_name", "")
-                    origin_code = str(entry.get("origin_code", "") or "")
-                    destination = str(entry.get("destination", "?"))
-                    status      = entry.get("status", "")
-                    delay       = entry.get("delay_min", 0)
-                    direction   = str(entry.get("direction", "?"))
-                    speed_mph   = float(entry.get("speed_mph") or 0.0)
-
-                    card = pygame.Rect(x - r.left, row_y - r.top, content_w, 46)
-                    pygame.draw.rect(rows_surface, (20, 27, 37), card, border_radius=8)
-                    pygame.draw.rect(rows_surface, (50, 67, 88), card, 1, border_radius=8)
-
-                    row1 = font_body.render(f"#{num}  {route[:20]}", True, C_TEXT)
-                    route_str = f"{origin_code} → {destination[:18]}" if origin_code else f"→ {destination[:20]}"
-                    row2 = font_small.render(
-                        f"{route_str}  •  {speed_mph:.0f} mph {direction}",
-                        True, C_TEXT_DIM
-                    )
-                    rows_surface.blit(row1, (card.left + 10, card.top + 5))
-                    rows_surface.blit(row2, (card.left + 10, card.top + 27))
-
-                    if status == "Departed":
-                        chip_bg = (66, 76, 90)
-                        chip_fg = (214, 221, 230)
-                    elif delay > 15:
-                        chip_bg = (145, 49, 49)
-                        chip_fg = (255, 234, 234)
-                    elif delay > 5:
-                        chip_bg = (122, 85, 20)
-                        chip_fg = (255, 233, 188)
-                    elif delay < -2:
-                        chip_bg = (25, 92, 69)
-                        chip_fg = (212, 252, 237)
-                    else:
-                        chip_bg = (32, 96, 62)
-                        chip_fg = (220, 249, 230)
-
-                    delay_tag = f"+{delay}m" if delay > 2 else (f"{delay}m" if delay < -2 else "")
-                    chip_text = ((status or "On Time") + (" " + delay_tag if delay_tag else "")).strip()[:14]
-                    chip = font_small.render(chip_text, True, chip_fg)
-                    chip_pad_x = 8
-                    chip_pad_y = 3
-                    chip_rect = pygame.Rect(
-                        card.right - chip.get_width() - (chip_pad_x * 2) - 8,
-                        card.top + 6,
-                        chip.get_width() + (chip_pad_x * 2),
-                        chip.get_height() + (chip_pad_y * 2),
-                    )
-                    pygame.draw.rect(rows_surface, chip_bg, chip_rect, border_radius=10)
-                    rows_surface.blit(chip, (chip_rect.left + chip_pad_x, chip_rect.top + chip_pad_y))
-                    row_y += 52
-
-                self._rows_surface = rows_surface
-                self._rows_cache_key = rows_cache_key
-                self._cache_dirty = False
-
-            surface.blit(self._rows_surface, r.topleft)
+                pygame.draw.rect(surf, chip_bg, chip_rect, border_radius=10)
+                surf.blit(chip_s, (chip_rect.left + cp_x, chip_rect.top + cp_y))
+                y += 52
 
             if total_pages > 1:
-                page_label = font_small.render(
-                    f"Page {page_idx + 1}/{total_pages}", True, C_TEXT_DIM
-                )
-                surface.blit(page_label, (r.right - page_label.get_width() - 12, r.bottom - page_label.get_height() - 8))
-
+                page_s = font_small.render(f"Page {page_idx + 1}/{total_pages}", True, C_TEXT_DIM)
+                surf.blit(page_s, (r.width - page_s.get_width() - 12, r.height - page_s.get_height() - 8))
         else:
             msg = font_body.render("Loading live train cards…", True, C_TEXT_DIM)
-            surface.blit(msg, (x, y + 6))
+            surf.blit(msg, (x, y + 6))
 
         if self._last_update:
-            ts = time.strftime("%H:%M:%S", time.localtime(self._last_update))
+            ts  = time.strftime("%H:%M", time.localtime(self._last_update))
             upd = font_small.render(f"Updated {ts}", True, C_TEXT_DIM)
-            surface.blit(upd, (x, r.bottom - upd.get_height() - 8))
+            surf.blit(upd, (x, r.height - upd.get_height() - 8))
+
+        return surf
 
 # ═══════════════════════════════════════════════════════════════════
 # SECTION 9: UPCOMING WATCH PANEL
