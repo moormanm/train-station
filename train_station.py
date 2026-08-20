@@ -1510,7 +1510,6 @@ class MotdPanel:
         self._index = 0
         self._last_rotate = time.time()
         self._current = self._facts[0]
-        self._scroll_train_sprite = _load_whimsical_train_sprite(target_h=56)
         self._line_cache_key = None
         self._line_surfaces = []
 
@@ -1561,28 +1560,6 @@ class MotdPanel:
             surface.blit(lbl, (r.left + 12, y))
             y += lbl.get_height() + 2
 
-        # countdown bar with sprite leader — position computed live each render for smooth motion
-        now_ts = time.time()
-        elapsed = now_ts - self._last_rotate
-        frac = min(1.0, elapsed / MOTD_ROTATE_SEC)
-        track_l = r.left + 10
-        track_r = r.right - 10
-        track_y = r.bottom - 6
-        progress_x = track_l + int((track_r - track_l) * (1.0 - frac))
-        pygame.draw.line(surface, C_SEPARATOR, (track_l, track_y), (track_r, track_y), 2)
-        pygame.draw.line(surface, C_ACCENT, (track_l, track_y), (progress_x, track_y), 3)
-        if self._scroll_train_sprite is not None:
-            sw = self._scroll_train_sprite.get_width()
-            sx = progress_x - (sw // 2)
-            sy = track_y - self._scroll_train_sprite.get_height() + 1
-            # clip the blit to the panel rect so the sprite never bleeds outside
-            clip_rect = pygame.Rect(r.left, r.top, r.width, r.height)
-            old_clip = surface.get_clip()
-            surface.set_clip(clip_rect)
-            surface.blit(self._scroll_train_sprite, (sx, sy))
-            surface.set_clip(old_clip)
-        else:
-            pygame.draw.circle(surface, C_ACCENT2, (progress_x, track_y), 4)
 
 # ═══════════════════════════════════════════════════════════════════
 # SECTION 11: MAIN APPLICATION
@@ -1733,8 +1710,8 @@ class TrainStationApp:
         r = self.header_rect
 
         now = time.localtime()
-        time_str = time.strftime("%H:%M:%S", now)
-        date_str = time.strftime("%A, %B %d %Y", now)
+        time_str = time.strftime("%H:%M", now)
+        date_str = time.strftime("%A", now)
         age = time.time() - self._last_data_update if self._last_data_update else -1
         status_key = "live" if age >= 0 and age < 120 else ("stale" if age >= 120 else "loading")
         cache_key = (time_str, date_str, status_key)
@@ -1776,9 +1753,9 @@ class TrainStationApp:
     def run(self):
         running = True
         last_update_check = 0
-        _HEADER_INTERVAL   = 0.5    # clock redraws twice per second
-        _PROGRESS_INTERVAL = 0.05   # motd train sprite: 20 fps (tiny rect, very cheap)
+        _HEADER_INTERVAL   = 30.0   # clock only shows HH:MM — redraw once per minute is plenty
         _SCHEDULE_INTERVAL = 1.0    # schedule panel: once per second is plenty
+        _PROGRESS_INTERVAL = _SCHEDULE_INTERVAL  # motd no longer animates; redraw with schedule
         _last_header_draw   = 0.0
         _last_progress_draw = 0.0
         _last_schedule_draw = 0.0
