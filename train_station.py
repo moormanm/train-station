@@ -16,13 +16,13 @@ SCHEDULE_RADIUS_MILES = 50  # nearby stations to show in schedule panel
 
 SCREEN_W = 1920  # unused — resolution is auto-detected at startup
 SCREEN_H = 1080  # unused — resolution is auto-detected at startup
-FPS_CAP = 20
+FPS_CAP = 20  # Pi B+: full screen rarely redraws; most ticks only touch the tiny motd rect
 
 TRAIN_UPDATE_SEC = 30       # how often to refresh train positions
 SCHEDULE_UPDATE_SEC = 30    # how often to refresh schedules
 MOTD_ROTATE_SEC = 30        # how often to cycle train fact
 SCHEDULE_PAGE_ROTATE_SEC = 10  # how often to flip Train Information pages
-PROGRESS_UPDATE_HZ = 20         # animate progress train per second
+PROGRESS_UPDATE_HZ = 1          # progress bar update rate (Pi: keep it cheap)
 SELF_UPDATE_INTERVAL_S = 5 * 60
 SELF_UPDATE_TIMEOUT_S = 120
 
@@ -1216,6 +1216,58 @@ class MapRenderer:
         surface.blit(self._surface, dest_xy)
         return needs_static_refresh
 
+    def render_trains_only(self, surface: pygame.Surface, trains: list,
+                           dest_xy: tuple[int, int] = (0, 0)):
+        """Blit only the live train layer onto surface, without touching the static layer.
+        Designed for Pi-optimised per-tick updates where only train dots move."""
+        # Start from the last-rendered static layer (already in self._static_surface)
+        self._surface.blit(self._static_surface, (0, 0))
+        for train in trains:
+            tlat = train.get("lat")
+            tlon = train.get("lon")
+            if not tlat or not tlon:
+                continue
+            px, py = self._latlon_to_px(tlat, tlon)
+            if -80 <= px < self.width + 80 and -80 <= py < self.height + 80:
+                num     = str(train.get("trainNum", "?"))
+                heading = (train.get("heading") or "E").upper().strip()
+                if heading not in _HEADING_ROT:
+                    heading = "E"
+                dot_color = _parse_hex_color(train.get("iconColor") or "#e8a020", (232, 160, 32))
+                dot_r = 16 if len(num) >= 4 else (15 if len(num) == 3 else 14)
+                vec = _HEADING_VEC.get(heading, _HEADING_VEC["E"])
+                arrow_len = dot_r + 10
+                ax0 = int(px + vec[0] * 4);  ay0 = int(py + vec[1] * 4)
+                ax1 = int(px + vec[0] * arrow_len); ay1 = int(py + vec[1] * arrow_len)
+                try:
+                    pygame.draw.line(self._surface, (20, 20, 24), (ax0, ay0), (ax1, ay1), 4)
+                    pygame.draw.line(self._surface, (250, 250, 250), (ax0, ay0), (ax1, ay1), 2)
+                    head_left  = (int(ax1 - vec[0]*5 - vec[1]*4), int(ay1 - vec[1]*5 + vec[0]*4))
+                    head_right = (int(ax1 - vec[0]*5 + vec[1]*4), int(ay1 - vec[1]*5 - vec[0]*4))
+                    pygame.draw.polygon(self._surface, (20, 20, 24), [(ax1,ay1), head_left, head_right])
+                    pygame.draw.polygon(self._surface, (250,250,250), [(ax1,ay1), head_left, head_right], 1)
+                except Exception:
+                    pass
+                pygame.draw.circle(self._surface, (20, 20, 24), (px + 1, py + 1), dot_r + 1)
+                pygame.draw.circle(self._surface, dot_color, (px, py), dot_r)
+                pygame.draw.circle(self._surface, (255, 255, 255), (px, py), dot_r, 2)
+                font_size = 15 if len(num) >= 3 else 18
+                num_cached = self._train_num_cache.get((num, font_size))
+                if num_cached is None:
+                    num_font = self._num_font_small if font_size == 15 else self._num_font_large
+                    num_cached = (
+                        num_font.render(num, True, (255, 255, 255)),
+                        num_font.render(num, True, (15, 15, 20)),
+                    )
+                    self._train_num_cache[(num, font_size)] = num_cached
+                num_surf, num_dark = num_cached
+                tx = px - num_surf.get_width() // 2
+                ty = py - num_surf.get_height() // 2
+                for odx, ody in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                    self._surface.blit(num_dark, (tx + odx, ty + ody))
+                self._surface.blit(num_surf, (tx, ty))
+        surface.blit(self._surface, dest_xy)
+
 # ═══════════════════════════════════════════════════════════════════
 # SECTION 8: SCHEDULE PANEL
 # ═══════════════════════════════════════════════════════════════════
@@ -1232,8 +1284,6 @@ class SchedulePanel:
         self._rows_surface = None
         self._rows_cache_key = None
         self._cache_dirty = True
-        self._progress_frac = 1.0
-        self._last_progress_sample = 0.0
 
     def update(self, entries: list):
         """entries from TransitDocsClient.get_nearby_schedule()"""
@@ -1490,8 +1540,6 @@ class MotdPanel:
         self._scroll_train_sprite = _load_whimsical_train_sprite(target_h=56)
         self._line_cache_key = None
         self._line_surfaces = []
-        self._progress_frac = 1.0
-        self._last_progress_sample = 0.0
 
     def update(self):
         if time.time() - self._last_rotate >= MOTD_ROTATE_SEC:
@@ -1540,14 +1588,10 @@ class MotdPanel:
             surface.blit(lbl, (r.left + 12, y))
             y += lbl.get_height() + 2
 
-        # countdown bar with sprite leader
+        # countdown bar with sprite leader — position computed live each render for smooth motion
         now_ts = time.time()
         elapsed = now_ts - self._last_rotate
-        progress_step_sec = 1.0 / max(1, PROGRESS_UPDATE_HZ)
-        if (now_ts - self._last_progress_sample) >= progress_step_sec:
-            self._progress_frac = min(1.0, elapsed / MOTD_ROTATE_SEC)
-            self._last_progress_sample = now_ts
-        frac = self._progress_frac
+        frac = min(1.0, elapsed / MOTD_ROTATE_SEC)
         track_l = r.left + 10
         track_r = r.right - 10
         track_y = r.bottom - 6
@@ -1593,19 +1637,35 @@ class TrainStationApp:
         # fonts
         self._init_fonts()
 
-        # ASM-style layout: full-screen map + floating cards
-        self.map_rect = pygame.Rect(0, 0, self.screen_w, self.screen_h)
-        self.header_rect = pygame.Rect(PANEL_GAP, PANEL_GAP, min(560, self.screen_w - (PANEL_GAP * 2)), 74)
+        # Layout: map on left, side panels on right — map does NOT overlap the side panel
+        MAP_BORDER = 2          # px border drawn around the map
+        MAP_PAD = PANEL_GAP     # padding between map border and side panel column
         drawer_w = min(440, int(self.screen_w * 0.32))
         fact_h = max(150, min(200, int(self.screen_h * 0.18)))
+        header_h = 90
+
+        # Side panel column starts at screen_w - drawer_w - PANEL_GAP
+        side_col_x = self.screen_w - drawer_w - PANEL_GAP
+        # Map occupies full height; its right edge leaves room for gap + border
+        map_w = side_col_x - MAP_PAD - MAP_BORDER
+        map_h = self.screen_h
+        self.map_rect = pygame.Rect(0, 0, map_w, map_h)
+        self.map_border_rect = pygame.Rect(0, 0, map_w + MAP_BORDER * 2, map_h + MAP_BORDER * 2)
+        self._map_border_px = MAP_BORDER
+
+        # Header sits at the top of the right-hand column
+        self.header_rect = pygame.Rect(side_col_x, PANEL_GAP, drawer_w, header_h)
+
+        # Schedule panel below the header
+        sched_top = PANEL_GAP + header_h + PANEL_GAP
         self.schedule_rect = pygame.Rect(
-            self.screen_w - drawer_w - PANEL_GAP,
-            PANEL_GAP,
+            side_col_x,
+            sched_top,
             drawer_w,
-            self.screen_h - (PANEL_GAP * 3) - fact_h
+            self.screen_h - sched_top - PANEL_GAP * 2 - fact_h
         )
         self.motd_rect = pygame.Rect(
-            self.screen_w - drawer_w - PANEL_GAP,
+            side_col_x,
             self.screen_h - PANEL_GAP - fact_h,
             drawer_w,
             fact_h
@@ -1631,6 +1691,14 @@ class TrainStationApp:
         self._bbox = self.map_renderer.get_view_bbox(pad_px=120)
         self._last_data_update = 0
         self._data_lock = threading.Lock()
+        # Separate dirty flag for train positions — set only when new train data arrives.
+        # Lets us skip render_trains_only entirely between 30s data fetches.
+        self._trains_dirty = True
+        # Cached map-area surface (static layer + current train dots). Blitted cheaply
+        # onto screen each tick without any re-rendering when trains haven't moved.
+        self._map_with_trains: pygame.Surface = pygame.Surface(
+            (self.map_rect.width, self.map_rect.height)
+        )
 
         # kick off first data fetch in background
         self._schedule_data_update()
@@ -1669,10 +1737,19 @@ class TrainStationApp:
             if amtrak_trains is not None:
                 self._amtrak_trains = amtrak_trains
                 self._last_data_update = time.time()
+                self._trains_dirty = True   # new positions → rebuild map+trains cache
             if infrastructure is not None:
                 self._infrastructure = infrastructure
+
         if amtrak_sched:
-            self.schedule_panel.update(amtrak_sched)
+            # Only show trains whose current position is visible on the map
+            min_lat, min_lon, max_lat, max_lon = self._bbox
+            visible_sched = [
+                e for e in amtrak_sched
+                if min_lat <= e.get("train_lat", 0) <= max_lat
+                and min_lon <= e.get("train_lon", 0) <= max_lon
+            ]
+            self.schedule_panel.update(visible_sched)
         self._bg_dirty = True
 
     def _schedule_data_update(self):
@@ -1726,15 +1803,20 @@ class TrainStationApp:
     def run(self):
         running = True
         last_update_check = 0
-        # Track the second of the last header render so we only redraw it once/sec.
-        _last_header_second = -1
-        # Track when the progress bars last changed so we can skip redraws.
-        _progress_interval = 1.0 / max(1, PROGRESS_UPDATE_HZ)
+        _HEADER_INTERVAL   = 0.5    # clock redraws twice per second
+        _PROGRESS_INTERVAL = 0.05   # motd train sprite: 20 fps (tiny rect, very cheap)
+        _SCHEDULE_INTERVAL = 1.0    # schedule panel: once per second is plenty
+        _last_header_draw   = 0.0
         _last_progress_draw = 0.0
-        # Composite background surface (map + schedule rows + motd text).
-        # Rebuilt only when data changes; progress bars / header blitted on top each tick.
-        _composite: pygame.Surface = pygame.Surface((self.screen_w, self.screen_h))
-        _composite_dirty = True
+        _last_schedule_draw = 0.0
+        # _static_bg: full screen — map static layer + all panels. No train dots, no clock.
+        # Rebuilt only when infrastructure/tiles/panels change.
+        _static_bg: pygame.Surface = pygame.Surface((self.screen_w, self.screen_h))
+        _static_bg_dirty = True
+        # _map_with_trains: map-area surface (static layer + current train dots).
+        # Rebuilt only when _static_bg or train positions change — typically every 30 s.
+        # Between rebuilds it is blitted as-is; no rendering work at all.
+        _map_cache = self._map_with_trains   # local alias
 
         while running:
             for event in pygame.event.get():
@@ -1745,7 +1827,6 @@ class TrainStationApp:
                         running = False
 
             now = time.time()
-            now_second = int(now)
 
             if now >= self._next_self_update_check:
                 self._next_self_update_check = now + SELF_UPDATE_INTERVAL_S
@@ -1753,83 +1834,110 @@ class TrainStationApp:
                     pygame.quit()
                     sys.exit(0)
 
-            # schedule periodic data refresh
             if now - last_update_check >= TRAIN_UPDATE_SEC:
                 self._schedule_data_update()
                 last_update_check = now
 
-            # ── decide what needs redrawing ──────────────────────────────
-            header_changed = (now_second != _last_header_second)
-            progress_changed = (now - _last_progress_draw) >= _progress_interval
-            # Check if new map tiles have arrived since last composite build
+            # ── detect what changed ──────────────────────────────────
             _, pending_tiles = self.map_renderer.tile_overlay.get_stats()
             tile_incomplete = self.map_renderer._tiles_drawn_last < self.map_renderer._total_tiles
             tiles_arrived = (pending_tiles == 0 and tile_incomplete)
-            map_needs_redraw = self._bg_dirty or self.map_renderer._static_cache_key is None or tiles_arrived
+            if self._bg_dirty or tiles_arrived:
+                _static_bg_dirty = True
 
-            if self._bg_dirty or map_needs_redraw:
-                _composite_dirty = True
-
-            # Rebuild composite when map/data changed
-            if _composite_dirty:
-                _composite.fill(C_BG)
+            # ── LEVEL 1: full static rebuild (infrastructure/tiles changed) ──
+            if _static_bg_dirty:
+                _static_bg.fill(C_BG)
                 with self._data_lock:
-                    trains = self._amtrak_trains
+                    trains = self._amtrak_trains[:]
                     infrastructure = self._infrastructure
-                map_rebuilt = self.map_renderer.render(
-                    _composite, infrastructure, trains,
+                # render() rebuilds _static_surface inside map_renderer
+                self.map_renderer.render(
+                    _static_bg, infrastructure, trains,
                     self.font_body, self.font_small,
                     self.map_rect.topleft
                 )
-                # ensure footer surface is initialized, then blit into composite
+                b = self._map_border_px
+                pygame.draw.rect(_static_bg, C_PANEL_BORDER,
+                                 pygame.Rect(0, 0, self.map_rect.width, self.map_rect.height), b)
                 self._render_footer_hint()
                 if self._footer_surface is not None:
-                    _composite.blit(
+                    _static_bg.blit(
                         self._footer_surface,
                         (PANEL_GAP, self.screen_h - self._footer_surface.get_height() - 8)
                     )
                 self.motd_panel.update()
-                _composite_dirty = False
-                self._bg_dirty = False
-                # force full screen copy
-                self.screen.blit(_composite, (0, 0))
-                # render schedule (has its own row-level cache)
                 self.schedule_panel.render(
-                    self.screen, self.font_title, self.font_body, self.font_small
+                    _static_bg, self.font_title, self.font_body, self.font_small
                 )
-                self.motd_panel.render(self.screen, self.font_title, self.font_small)
+                self.motd_panel.render(_static_bg, self.font_title, self.font_small)
+
+                # Also rebuild _map_with_trains from the fresh static surface
+                self.map_renderer.render_trains_only(_map_cache, trains)
+                b = self._map_border_px
+                pygame.draw.rect(_map_cache, C_PANEL_BORDER,
+                                 pygame.Rect(0, 0, self.map_rect.width, self.map_rect.height), b)
+                self._trains_dirty = False
+
+                self.screen.blit(_static_bg, (0, 0))
+                self.screen.blit(_map_cache, self.map_rect.topleft)
                 self._render_header()
-                _last_header_second = now_second
+                _last_header_draw   = now
                 _last_progress_draw = now
+                _last_schedule_draw = now
                 pygame.display.flip()
+                _static_bg_dirty = False
+                self._bg_dirty = False
                 self.clock.tick(FPS_CAP)
                 continue
 
-            # Nothing structural changed — only repaint regions that update each tick
+            # ── LEVEL 2: train positions changed (every ~30 s) ───────
+            if self._trains_dirty:
+                with self._data_lock:
+                    trains = self._amtrak_trains[:]
+                self.map_renderer.render_trains_only(_map_cache, trains)
+                b = self._map_border_px
+                pygame.draw.rect(_map_cache, C_PANEL_BORDER,
+                                 pygame.Rect(0, 0, self.map_rect.width, self.map_rect.height), b)
+                self._trains_dirty = False
+                self.screen.blit(_map_cache, self.map_rect.topleft)
+                self._render_header()
+                _last_header_draw = now
+                pygame.display.update([self.map_rect, self.header_rect])
+                self.clock.tick(FPS_CAP)
+                continue
+
+            # ── LEVEL 3: only clock / progress bars need updating ────
             dirty_rects: list[pygame.Rect] = []
 
-            if header_changed:
+            if now - _last_header_draw >= _HEADER_INTERVAL:
                 self._render_header()
                 dirty_rects.append(self.header_rect)
-                _last_header_second = now_second
+                _last_header_draw = now
 
-            if progress_changed:
-                # Repaint schedule progress bar area
+            # motd: redraws at full animation rate — only the small fact panel rect
+            if now - _last_progress_draw >= _PROGRESS_INTERVAL:
+                self.motd_panel.update()
+                self.screen.blit(_static_bg, self.motd_panel.rect.topleft, self.motd_panel.rect)
+                self.motd_panel.render(self.screen, self.font_title, self.font_small)
+                dirty_rects.append(self.motd_panel.rect)
+                _last_progress_draw = now
+
+            # schedule: pages flip every few seconds, no need to render frequently
+            if now - _last_schedule_draw >= _SCHEDULE_INTERVAL:
                 sched_r = self.schedule_panel.rect
-                prog_region = pygame.Rect(sched_r.left, sched_r.bottom - 20, sched_r.width, 20)
-                self.screen.blit(_composite, prog_region.topleft, prog_region)
+                self.screen.blit(_static_bg, sched_r.topleft, sched_r)
                 self.schedule_panel.render(
                     self.screen, self.font_title, self.font_body, self.font_small
                 )
                 dirty_rects.append(sched_r)
+                _last_schedule_draw = now
 
-                # Repaint motd progress bar area
-                motd_r = self.motd_panel.rect
-                self.motd_panel.update()
-                self.motd_panel.render(self.screen, self.font_title, self.font_small)
-                dirty_rects.append(motd_r)
+            # ── LEVEL 4: nothing changed — just sleep ────────────────
+            if dirty_rects:
+                pygame.display.update(dirty_rects)
 
-                _last_progress_draw = now
+            self.clock.tick(FPS_CAP)
 
             if dirty_rects:
                 pygame.display.update(dirty_rects)
