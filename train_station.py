@@ -34,7 +34,7 @@ PANEL_GAP = 16
 TILE_SIZE = 256             # OSM tile size in pixels
 TILE_ZOOM = 9               # zoom level (9 zooms in a bit tighter on the origin area)
 OSM_TILE_URL = "https://basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png"
-PAGE_TRAIN_GIF_URL = "https://www.animatedimages.org/data/media/75/animated-train-image-0043.gif"
+RENDER_BOUNDS_MARGIN = 128  # pixels off-screen to render (for smooth scrolling)
 
 # ── Colors ──────────────────────────────────────────────────────────
 C_BG          = (8,  12,  18)
@@ -149,43 +149,6 @@ def haversine_miles(lat1, lon1, lat2, lon2):
     a = math.sin(dlat/2)**2 + math.cos(math.radians(lat1)) * math.cos(math.radians(lat2)) * math.sin(dlon/2)**2
     return R * 2 * math.asin(math.sqrt(a))
 
-def latlon_to_tile(lat, lon, zoom):
-    """Convert lat/lon to tile (x, y) at the given zoom level."""
-    lat_r = math.radians(lat)
-    n = 2 ** zoom
-    x = int((lon + 180.0) / 360.0 * n)
-    y = int((1.0 - math.asinh(math.tan(lat_r)) / math.pi) / 2.0 * n)
-    return x, y
-
-def tile_to_latlon(x, y, zoom):
-    """Convert tile (x, y) to lat/lon of the NW corner."""
-    n = 2 ** zoom
-    lon = x / n * 360.0 - 180.0
-    lat_r = math.atan(math.sinh(math.pi * (1 - 2 * y / n)))
-    lat = math.degrees(lat_r)
-    return lat, lon
-
-def latlon_to_pixel(lat, lon, origin_tile_x, origin_tile_y, zoom, surface_origin_px):
-    """
-    Convert lat/lon to pixel coordinates on the map surface.
-    surface_origin_px: (px, py) pixel offset of origin_tile_x/y on the surface.
-    """
-    tx, ty = latlon_to_tile(lat, lon, zoom)
-    # fractional tile position
-    lat_r = math.radians(lat)
-    n = 2 ** zoom
-    fx = (lon + 180.0) / 360.0 * n
-    fy = (1.0 - math.asinh(math.tan(lat_r)) / math.pi) / 2.0 * n
-    px = surface_origin_px[0] + (fx - origin_tile_x) * TILE_SIZE
-    py = surface_origin_px[1] + (fy - origin_tile_y) * TILE_SIZE
-    return int(px), int(py)
-
-def bbox_from_origin(lat, lon, radius_miles):
-    """Return (min_lat, min_lon, max_lat, max_lon) for a square bounding box."""
-    d_lat = radius_miles / 69.0
-    d_lon = radius_miles / (69.0 * math.cos(math.radians(lat)))
-    return (lat - d_lat, lon - d_lon, lat + d_lat, lon + d_lon)
-
 def _parse_hex_color(color_hex: str, fallback: tuple[int, int, int]) -> tuple[int, int, int]:
     if not color_hex or not isinstance(color_hex, str) or len(color_hex) != 7 or not color_hex.startswith("#"):
         return fallback
@@ -200,28 +163,6 @@ def _log_http(method: str, url: str, detail: str = ""):
     if detail:
         msg += f" :: {detail}"
     print(msg, flush=True)
-
-def _load_whimsical_train_sprite(target_h: int = 32):
-    """Load train GIF and convert white pixels to transparent for UI overlays."""
-    try:
-        resp = requests.get(PAGE_TRAIN_GIF_URL, timeout=8)
-        _log_http("GET", PAGE_TRAIN_GIF_URL, f"status={resp.status_code}")
-        resp.raise_for_status()
-        img = Image.open(io.BytesIO(resp.content)).convert("RGBA")
-        px = img.load()
-        w, h = img.size
-        for yy in range(h):
-            for xx in range(w):
-                r, g, b, _ = px[xx, yy]
-                if r >= 245 and g >= 245 and b >= 245:
-                    px[xx, yy] = (255, 255, 255, 0)
-        out_h = max(12, int(target_h))
-        out_w = max(20, int(w * (out_h / max(1, h))))
-        img = img.resize((out_w, out_h), Image.Resampling.LANCZOS)
-        return pygame.image.fromstring(img.tobytes(), img.size, "RGBA").convert_alpha()
-    except Exception:
-        _log_http("GET", PAGE_TRAIN_GIF_URL, "error")
-        return None
 
 def _git_head(repo_dir: str):
     try:
@@ -295,60 +236,6 @@ def _maybe_self_update_and_restart(repo_dir: str) -> bool:
 # ═══════════════════════════════════════════════════════════════════
 # SECTION 5: TRANSITDOCS CLIENT
 # ═══════════════════════════════════════════════════════════════════
-
-class MapTileOverlay:
-    """Non-blocking in-memory tile cache for subdued dark basemap overlay."""
-
-    def __init__(self, url_template: str, max_tiles: int = 420):
-        self.url_template = url_template
-        self.max_tiles = max_tiles
-        self._cache: OrderedDict = OrderedDict()
-        self._pending = set()
-        self._lock = threading.Lock()
-        self._session = requests.Session()
-        self._session.headers.update({
-            "User-Agent": "TrainStationKiosk/1.0 (train enthusiast display; contact: kiosk@local)"
-        })
-
-    def get(self, z: int, x: int, y: int):
-        key = (z, x, y)
-        with self._lock:
-            if key in self._cache:
-                self._cache.move_to_end(key)
-                return self._cache[key]
-            if key in self._pending:
-                return None
-            self._pending.add(key)
-        threading.Thread(target=self._fetch_tile, args=(key,), daemon=True).start()
-        return None
-
-    def _fetch_tile(self, key):
-        z, x, y = key
-        url = self.url_template.replace("{z}", str(z)).replace("{x}", str(x)).replace("{y}", str(y))
-        surf = None
-        try:
-            resp = self._session.get(url, timeout=8)
-            _log_http("GET", url, f"status={resp.status_code}")
-            if resp.status_code == 200:
-                img = Image.open(io.BytesIO(resp.content)).convert("RGBA")
-                surf = pygame.image.fromstring(img.tobytes(), img.size, "RGBA")
-        except Exception:
-            _log_http("GET", url, "error")
-            surf = None
-        finally:
-            with self._lock:
-                self._pending.discard(key)
-                if surf is not None:
-                    self._cache[key] = surf
-                    self._cache.move_to_end(key)
-                    while len(self._cache) > self.max_tiles:
-                        self._cache.popitem(last=False)
-
-    def get_stats(self) -> tuple[int, int]:
-        """Return (cached_tiles, pending_tiles) for render throttling."""
-        with self._lock:
-            return len(self._cache), len(self._pending)
-
 
 class TransitDocsClient:
     """Transitdocs-only data client for trains, stations, schedules, and rail overlay."""
@@ -714,189 +601,6 @@ class TransitDocsClient:
 #   Source: https://github.com/googlefonts/noto-emoji
 #   Loaded once at startup via rsvg-convert, tinted per route color.
 # ═══════════════════════════════════════════════════════════════════
-
-# Noto emoji 🚂 SVG embedded as base64 — no network needed at runtime
-_TRAIN_SVG_B64 = (
-    "PD94bWwgdmVyc2lvbj0iMS4wIiBlbmNvZGluZz0idXRmLTgiPz4KPCEtLSBHZW5lcmF0b3I6IEFk"
-    "b2JlIElsbHVzdHJhdG9yIDI1LjIuMywgU1ZHIEV4cG9ydCBQbHVnLUluIC4gU1ZHIFZlcnNpb246"
-    "IDYuMDAgQnVpbGQgMCkgIC0tPgo8c3ZnIHZlcnNpb249IjEuMSIgaWQ9IkxheWVyXzYiIHhtbG5z"
-    "PSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyIgeG1sbnM6eGxpbms9Imh0dHA6Ly93d3cudzMu"
-    "b3JnLzE5OTkveGxpbmsiIHg9IjBweCIgeT0iMHB4IgoJIHZpZXdCb3g9IjAgMCAxMjggMTI4IiBz"
-    "dHlsZT0iZW5hYmxlLWJhY2tncm91bmQ6bmV3IDAgMCAxMjggMTI4OyIgeG1sOnNwYWNlPSJwcmVz"
-    "ZXJ2ZSI+CjxwYXRoIHN0eWxlPSJmaWxsOiNGNDQzMzY7IiBkPSJNMjIuNzMsOTkuNTNjLTIuMzUs"
-    "MC4wMi00LjUzLDEuMjEtNS44MiwzLjE3TDQuODMsMTIxLjA4bDAuMDksMGMtMS4wOCwwLjAyLTEu"
-    "OTUsMC44OS0xLjk1LDEuOTgKCXYwLjAyYzAsMC40MSwwLjMzLDAuNzQsMC43NCwwLjc0SDIxLjdj"
-    "MC40MSwwLDAuNzQtMC4zMywwLjc0LTAuNzR2LTAuMDJjMC0wLjk2LTAuNjgtMS43Ni0xLjU4LTEu"
-    "OTRsMS44NS0xMS40MkwyMi43Myw5OS41M3oiLz4KPHBhdGggc3R5bGU9Im9wYWNpdHk6MC44NTtm"
-    "aWxsOiNCREJEQkQ7IiBkPSJNNDMuMzcsMjIuMmMyLjIxLDAuMDIsNC4wNywxLjczLDYuMjMsMi4x"
-    "NmM4LjIyLDEuNjUsMTAuMi0yLjI0LDEyLjk4LTMuMDkKCWMyLjc4LTAuODUsNi43OCwyLjc3LDEz"
-    "LjYxLTAuMjljMy41NS0xLjU5LDQuODQtNi40NSwzLjI1LTkuODZjLTAuNTItMS4xMi0zLjU3LTcu"
-    "NTMtMTQuMzctNS45Yy0wLjgyLDAuMTItMS42MiwwLjM0LTIuNDIsMC41MwoJYy01LjY2LDEuMzUt"
-    "OC4zMS0yLjc3LTE4LjgyLTAuOTdjLTE3LjIsMi45NC0xNi43NCwyMC4wNi0xNS4zMiwyMy4wNEMy"
-    "OC41MSwyNy44MiwzNC4yNCwyMi4xLDQzLjM3LDIyLjJ6Ii8+CjxwYXRoIHN0eWxlPSJvcGFjaXR5"
-    "OjAuNjU7ZmlsbDojRTBFMEUwOyIgZD0iTTI3LjAzLDguODljMy43OS0zLjYyLDEwLjUzLTQuNDks"
-    "MTQuODEtMS40MmMwLjYzLDAuNDUsMS4yMywxLDIuMDEsMS4xOQoJYzAuNzUsMC4xOSwxLjU1LDAu"
-    "MDIsMi4zMi0wLjFjMi45MS0wLjQzLDYuMTgsMC4xMiw4LjEzLDIuMThjMS45NSwyLjA2LDEuNzgs"
-    "NS43MS0wLjcsNy4yYy00LjgxLDIuODgtOC42My0xLjE1LTE2Ljg0LDEuNgoJYy00LjkxLDEuNjUt"
-    "OC4zNyw2LTkuNjksMTAuNzJDMjcuMDcsMzAuMjcsMTguMzEsMTcuMjIsMjcuMDMsOC44OXoiLz4K"
-    "PHBhdGggc3R5bGU9ImZpbGw6IzQyNDI0MjsiIGQ9Ik00NC45OCwyMS43OWMwLTAuNTMtMC40My0w"
-    "Ljk2LTAuOTYtMC45NkgxNy43M2MtMC41MywwLTAuOTYsMC40My0wLjk2LDAuOTZ2NS40NgoJYzIu"
-    "MTEsNy44OSw3LjIsMTUuNDQsOC4xNywxNi44M3YxOS41OUgzNi44VjQ0LjA5YzAuOTQtMS4zLDUu"
-    "NzUtOC4xOCw4LjE3LTE2Ljg0VjIxLjc5eiIvPgo8cG9seWdvbiBzdHlsZT0iZmlsbDojNDI0MjQy"
-    "OyIgcG9pbnRzPSIxMjEuODcsODUuNDQgMTE1Ljk1LDg3LjczIDIyLjcsODcuNzMgMjIuNywxMDku"
-    "NyAzMy4xNiwxMDkuNyAzMy4xNiwxMTcuNjYgNDguNDQsMTE3LjY2IAoJNDguNDQsMTA5LjcgMTIx"
-    "Ljg3LDEwOS43ICIvPgo8cGF0aCBzdHlsZT0iZmlsbDojNDI0MjQyOyIgZD0iTTM5Ljg2LDg5LjQ4"
-    "bC0xNy4xNi0wLjAxYzAsMCwwLjgtNi4yNiwwLjgtMTMuNzVTMjIuNjUsNjEuOSwyMi42NSw2MS45"
-    "aDE2Ljc3CgljMCwwLDAuOTQsNC4wMiwwLjk0LDEzLjQyUzM5Ljg2LDg5LjQ4LDM5Ljg2LDg5LjQ4"
-    "eiIvPgo8cGF0aCBzdHlsZT0iZmlsbDojMjEyMTIxOyIgZD0iTTU0LjQsOTguNDVoLTIuOTRjLTAu"
-    "MS0yLjI4LTAuMzgtMy41MS0wLjc0LTQuMjNjLTAuMzItMC42Mi0wLjktMS4xLTEuNi0xLjEKCWMt"
-    "MC41OCwwLTE2LjU0LDcuMDMtMTYuNTQsNy4wM2MwLDMuODgsMC43MSw3LjAzLDEuNTksNy4wM2Mw"
-    "LDAsMTMsMCwxNC41OSwwYzIuMjEsMCwyLjY5LTIuMjUsMi43NC01LjdoMi4zNmwxOS42Nyw4LjMx"
-    "bDYuMzIsMC4wNAoJTDU0LjQsOTguNDV6Ii8+Cjxwb2x5Z29uIHN0eWxlPSJmaWxsOiM2MDYwNjA7"
-    "IiBwb2ludHM9IjEwMy4wMiw4OS40OCA3MC4wNSw4OS40OCA2OS41OSw2MS45IDc4LjIxLDU5LjIz"
-    "IDc3Ljk5LDc0LjQxIDEwMy43NCw3NC40MSAiLz4KPHBhdGggc3R5bGU9ImZpbGw6IzAwNzk2Qjsi"
-    "IGQ9Ik0zOS4zMSw4OS40OGwyOS4yLDBjMC42Ny0zLjQ0LDEuMzQtOC4yNCwxLjM0LTEzLjcyYzAt"
-    "MTEuMDYtMS43NS0xMy44Ny0xLjc1LTEzLjg3SDUzLjExSDM5LjEKCWMwLDAsMC45MSw2LjM1LDAu"
-    "OTEsMTMuODRDNDAuMDEsODMuMjMsMzkuMzEsODkuNDgsMzkuMzEsODkuNDh6Ii8+CjxnPgoJPGc+"
-    "CgkJPHBhdGggc3R5bGU9ImZpbGw6IzU0NkU3QTsiIGQ9Ik01MC4wMywxMTIuMTZjMi4xNiwwLDMu"
-    "OTIsMS43NiwzLjkyLDMuOTJTNTIuMTksMTIwLDUwLjAzLDEyMHMtMy45Mi0xLjc2LTMuOTItMy45"
-    "MgoJCQlTNDcuODcsMTEyLjE2LDUwLjAzLDExMi4xNiBNNTAuMDMsMTA4LjE2Yy00LjM3LDAtNy45"
-    "MiwzLjU1LTcuOTIsNy45MnMzLjU1LDcuOTIsNy45Miw3LjkyYzQuMzcsMCw3LjkyLTMuNTUsNy45"
-    "Mi03LjkyCgkJCVM1NC40LDEwOC4xNiw1MC4wMywxMDguMTZMNTAuMDMsMTA4LjE2eiIvPgoJPC9n"
-    "PgoJPGNpcmNsZSBzdHlsZT0iZmlsbDojRjQ0MzM2OyIgY3g9IjUwLjAzIiBjeT0iMTE2LjA4IiBy"
-    "PSI0LjU4Ii8+CjwvZz4KPGc+Cgk8Zz4KCQk8cGF0aCBzdHlsZT0iZmlsbDojNTQ2RTdBOyIgZD0i"
-    "TTMxLjU3LDExMi4xNmMyLjE2LDAsMy45MiwxLjc2LDMuOTIsMy45MlMzMy43MywxMjAsMzEuNTcs"
-    "MTIwcy0zLjkyLTEuNzYtMy45Mi0zLjkyCgkJCVMyOS40MSwxMTIuMTYsMzEuNTcsMTEyLjE2IE0z"
-    "MS41NywxMDguMTZjLTQuMzcsMC03LjkyLDMuNTUtNy45Miw3LjkyUzI3LjIsMTI0LDMxLjU3LDEy"
-    "NHM3LjkyLTMuNTUsNy45Mi03LjkyCgkJCVMzNS45NSwxMDguMTYsMzEuNTcsMTA4LjE2TDMxLjU3"
-    "LDEwOC4xNnoiLz4KCTwvZz4KCTxjaXJjbGUgc3R5bGU9ImZpbGw6I0Y0NDMzNjsiIGN4PSIzMS41"
-    "NyIgY3k9IjExNi4wOCIgcj0iNC41OCIvPgo8L2c+CjxwYXRoIHN0eWxlPSJmaWxsOm5vbmU7c3Ry"
-    "b2tlOiM2MDdEOEI7c3Ryb2tlLXdpZHRoOjM7c3Ryb2tlLW1pdGVybGltaXQ6MTA7IiBkPSJNMzYu"
-    "ODIsMTA0Ljk4Ii8+CjxwYXRoIHN0eWxlPSJmaWxsOiNDNjI4Mjg7IiBkPSJNNzcuOTcsMzguOTR2"
-    "NDQuNjdoNDQuMjNWMzguOTRINzcuOTd6IE0xMTcuNjcsNzcuOTdIODIuNTRWNDMuODVoMzUuMTJW"
-    "NzcuOTd6Ii8+CjxwYXRoIHN0eWxlPSJmaWxsOiMyRjc4ODk7IiBkPSJNMjkuNDUsMjcuODVIMTku"
-    "MjhWMjIuNGMwLTAuNTMsMC40My0wLjk2LDAuOTYtMC45Nmg4LjI1YzAuNTMsMCwwLjk2LDAuNDMs"
-    "MC45NiwwLjk2VjI3Ljg1eiIvPgo8cmVjdCB4PSIyNi42OSIgeT0iNDQuMSIgc3R5bGU9ImZpbGw6"
-    "IzJGNzg4OTsiIHdpZHRoPSI1LjYyIiBoZWlnaHQ9IjE3Ljc5Ii8+CjxwYXRoIHN0eWxlPSJmaWxs"
-    "OiMyRjc4ODk7IiBkPSJNMjQuNDgsNjcuODNjMC4xNywxLjM4LDAuNCwzLjUyLDAuNDcsNS43OWMw"
-    "LjAyLDAuNzUsMC42MywxLjM0LDEuMzgsMS4zNGgxMC44NAoJYzAuNzgsMCwxLjQxLTAuNjUsMS4z"
-    "OS0xLjQzYy0wLjA3LTMuMjYtMC4xNC01LjE2LTAuNC02LjJjLTAuMTYtMC42Mi0wLjcxLTEuMDYt"
-    "MS4zNS0xLjA2SDI1Ljg1CglDMjUuMDIsNjYuMjgsMjQuMzcsNjcuMDEsMjQuNDgsNjcuODN6Ii8+"
-    "CjxwYXRoIHN0eWxlPSJmaWxsOiM0Q0E4NTQ7IiBkPSJNNDEuNjEsNjcuODNjMC4xMywxLjM4LDAu"
-    "MywzLjUyLDAuMzYsNS43OWMwLjAyLDAuNzUsMC40OSwxLjM0LDEuMDYsMS4zNGg4LjMyCgljMC42"
-    "LDAsMS4wOC0wLjY1LDEuMDctMS40M2MtMC4wNi0zLjI2LTAuMy01LjE2LTAuNS02LjJjLTAuMTIt"
-    "MC42Mi0wLjU0LTEuMDYtMS4wMy0xLjA2aC04LjIyQzQyLjAzLDY2LjI4LDQxLjUzLDY3LjAxLDQx"
-    "LjYxLDY3LjgzCgl6Ii8+CjxwYXRoIHN0eWxlPSJmaWxsOiM0Q0E4NTQ7IiBkPSJNNTcuMDEsNjcu"
-    "ODNjMC4xMywxLjM4LDAuMywzLjUyLDAuMzYsNS43OWMwLjAyLDAuNzUsMC40OSwxLjM0LDEuMDYs"
-    "MS4zNGg4LjMyCgljMC42LDAsMS4wOC0wLjY1LDEuMDctMS40M2MtMC4wNi0zLjI2LTAuMy01LjE2"
-    "LTAuNS02LjJjLTAuMTItMC42Mi0wLjU0LTEuMDYtMS4wMy0xLjA2aC04LjIyQzU3LjQzLDY2LjI4"
-    "LDU2LjkzLDY3LjAxLDU3LjAxLDY3LjgzCgl6Ii8+CjxwYXRoIHN0eWxlPSJmaWxsOiNGNDQzMzY7"
-    "IiBkPSJNODAuNjIsNDQuMDdWNzYuOWMwLDAuOTcsMC43OSwxLjc2LDEuNzcsMS43NmgzNS42OGMw"
-    "Ljk3LDAsMS43Ni0wLjc5LDEuNzYtMS43NlY0NC4wNwoJYzAtMC45Ny0wLjc5LTEuNzYtMS43Ni0x"
-    "Ljc2SDgyLjM4QzgxLjQxLDQyLjMxLDgwLjYyLDQzLjEsODAuNjIsNDQuMDd6IE0xMDguMTksNjku"
-    "NTRjMCwwLjUyLTAuNDcsMC45NC0xLjA2LDAuOTRIOTMuMzEKCWMtMC41OCwwLTEuMDYtMC40Mi0x"
-    "LjA2LTAuOTRWNTIuNDVjMC42Ni0wLjg4LDMuMS0zLjYxLDcuOTctMy42MWM0Ljg4LDAsNy4zMSwy"
-    "LjczLDcuOTcsMy42MVY2OS41NHoiLz4KPGc+Cgk8cG9seWdvbiBzdHlsZT0iZmlsbDojNDI0MjQy"
-    "OyIgcG9pbnRzPSIxOS4yNiwxMDQuNzEgMTguMTksMTA0LjcxIDguNjYsMTIxLjA4IDEwLjk2LDEy"
-    "MS4wOCAJIi8+Cgk8cG9seWdvbiBzdHlsZT0iZmlsbDojNDI0MjQyOyIgcG9pbnRzPSIyMS42Mywx"
-    "MDQuNjggMjAuNTgsMTA0LjY4IDE0Ljk5LDEyMS4wOCAxNy4xMywxMjEuMDggCSIvPgo8L2c+Cjxn"
-    "PgoJPHBhdGggc3R5bGU9ImZpbGw6I0UyQTYxMDsiIGQ9Ik01Ni4xMyw3NS45NmMwLTcuMTktMS4w"
-    "OC0xNC4wNy0xLjA4LTE0LjA3aC0yLjA0YzAsMCwxLjExLDYuMTcsMS4xMSwxNC4wNwoJCWMwLDcu"
-    "OTctMC45MiwxMy41Mi0wLjkyLDEzLjUyaDIuMDFDNTUuMjEsODkuNDgsNTYuMTMsODMuNDksNTYu"
-    "MTMsNzUuOTZ6Ii8+CjwvZz4KPGc+Cgk8cGF0aCBzdHlsZT0iZmlsbDojRTJBNjEwOyIgZD0iTTcw"
-    "Ljk0LDc1Ljk2YzAtNy4xOS0xLjA4LTE0LjA3LTEuMDgtMTQuMDdoLTIuMDRjMCwwLDEuMTEsNi4x"
-    "NywxLjExLDE0LjA3CgkJYzAsNy45Ny0wLjg4LDEzLjUyLTAuODgsMTMuNTJoMi4wMUM3MC4wNSw4"
-    "OS40OCw3MC45NCw4My40OSw3MC45NCw3NS45NnoiLz4KPC9nPgo8Zz4KCTxwYXRoIHN0eWxlPSJm"
-    "aWxsOiM1NDZFN0E7IiBkPSJNMTA3LjU3LDk4LjRMMTA3LjU3LDk4LjRjNC44MiwwLDkuMTEsMy4w"
-    "NiwxMC42OCw3LjYyYzAuOTgsMi44NSwwLjgsNS45Mi0wLjUyLDguNjMKCQljLTEuMzIsMi43MS0z"
-    "LjYyLDQuNzUtNi40Nyw1Ljc0Yy0xLjIsMC40MS0yLjQ0LDAuNjItMy42OSwwLjYyYy00LjgyLDAt"
-    "OS4xMS0zLjA2LTEwLjY4LTcuNjJjLTAuOTgtMi44NS0wLjgtNS45MiwwLjUyLTguNjMKCQljMS4z"
-    "Mi0yLjcxLDMuNjItNC43NSw2LjQ3LTUuNzRDMTA1LjA4LDk4LjYsMTA2LjMyLDk4LjQsMTA3LjU3"
-    "LDk4LjQgTTEwNy41Nyw5NS40Yy0xLjU1LDAtMy4xMiwwLjI1LTQuNjcsMC43OQoJCWMtNy40Niwy"
-    "LjU4LTExLjQzLDEwLjcyLTguODUsMTguMThjMi4wNCw1LjkyLDcuNTksOS42NCwxMy41Miw5LjY0"
-    "YzEuNTUsMCwzLjEyLTAuMjUsNC42Ny0wLjc5YzcuNDYtMi41OCwxMS40My0xMC43Miw4Ljg1LTE4"
-    "LjE4CgkJQzExOS4wNCw5OS4xMSwxMTMuNSw5NS40LDEwNy41Nyw5NS40TDEwNy41Nyw5NS40eiIv"
-    "Pgo8L2c+CjxnPgoJPHBhdGggc3R5bGU9ImZpbGw6I0Y0NDMzNjsiIGQ9Ik0xMDcuNTcsMTAwLjE5"
-    "TDEwNy41NywxMDAuMTljNC4wNSwwLDcuNjYsMi41OCw4Ljk5LDYuNDFjMC44MywyLjQsMC42Nyw0"
-    "Ljk4LTAuNDQsNy4yNgoJCWMtMS4xMSwyLjI4LTMuMDUsNC01LjQ1LDQuODNjLTEuMDEsMC4zNS0y"
-    "LjA1LDAuNTItMy4xLDAuNTJjLTQuMDUsMC03LjY2LTIuNTgtOC45OS02LjQxYy0wLjgzLTIuNC0w"
-    "LjY3LTQuOTgsMC40NC03LjI2CgkJYzEuMTEtMi4yOCwzLjA1LTQsNS40NS00LjgzQzEwNS40Nywx"
-    "MDAuMzYsMTA2LjUyLDEwMC4xOSwxMDcuNTcsMTAwLjE5IE0xMDcuNTcsOTguMTljLTEuMjUsMC0y"
-    "LjUxLDAuMi0zLjc2LDAuNjMKCQljLTYuMDEsMi4wNy05LjIsOC42Mi03LjEyLDE0LjYzYzEuNjQs"
-    "NC43Niw2LjEsNy43NiwxMC44OCw3Ljc2YzEuMjUsMCwyLjUxLTAuMiwzLjc2LTAuNjNjNi4wMS0y"
-    "LjA3LDkuMi04LjYyLDcuMTItMTQuNjMKCQlDMTE2LjgsMTAxLjE4LDExMi4zNCw5OC4xOSwxMDcu"
-    "NTcsOTguMTlMMTA3LjU3LDk4LjE5eiIvPgo8L2c+CjxnPgoJPGxpbmUgc3R5bGU9ImZpbGw6bm9u"
-    "ZTtzdHJva2U6I0Y0NDMzNjtzdHJva2Utd2lkdGg6MztzdHJva2UtbWl0ZXJsaW1pdDoxMDsiIHgx"
-    "PSIxMTcuNjUiIHkxPSIxMDkuNyIgeDI9Ijk3LjQ4IiB5Mj0iMTA5LjciLz4KCTxsaW5lIHN0eWxl"
-    "PSJmaWxsOm5vbmU7c3Ryb2tlOiNGNDQzMzY7c3Ryb2tlLXdpZHRoOjM7c3Ryb2tlLW1pdGVybGlt"
-    "aXQ6MTA7IiB4MT0iMTAyLjUyIiB5MT0iMTAwLjk2IiB4Mj0iMTEyLjYxIiB5Mj0iMTE4LjQzIi8+"
-    "Cgk8bGluZSBzdHlsZT0iZmlsbDpub25lO3N0cm9rZTojRjQ0MzM2O3N0cm9rZS13aWR0aDozO3N0"
-    "cm9rZS1taXRlcmxpbWl0OjEwOyIgeDE9IjEwMi41MiIgeTE9IjExOC40MyIgeDI9IjExMi42MSIg"
-    "eTI9IjEwMC45NiIvPgo8L2c+CjxnPgoJPHBhdGggc3R5bGU9ImZpbGw6IzU0NkU3QTsiIGQ9Ik03"
-    "Ni40OCw5OC40TDc2LjQ4LDk4LjRjNC44MiwwLDkuMTEsMy4wNiwxMC42OCw3LjYyYzAuOTgsMi44"
-    "NSwwLjgsNS45Mi0wLjUyLDguNjMKCQljLTEuMzIsMi43MS0zLjYyLDQuNzUtNi40Nyw1Ljc0Yy0x"
-    "LjIsMC40MS0yLjQ0LDAuNjItMy42OSwwLjYyYy00LjgyLDAtOS4xMS0zLjA2LTEwLjY4LTcuNjJj"
-    "LTAuOTgtMi44NS0wLjgtNS45MiwwLjUyLTguNjMKCQljMS4zMi0yLjcxLDMuNjItNC43NSw2LjQ3"
-    "LTUuNzRDNzMuOTksOTguNiw3NS4yMyw5OC40LDc2LjQ4LDk4LjQgTTc2LjQ4LDk1LjRjLTEuNTUs"
-    "MC0zLjEyLDAuMjUtNC42NywwLjc5CgkJYy03LjQ2LDIuNTgtMTEuNDMsMTAuNzItOC44NSwxOC4x"
-    "OGMyLjA0LDUuOTIsNy41OSw5LjY0LDEzLjUyLDkuNjRjMS41NSwwLDMuMTItMC4yNSw0LjY3LTAu"
-    "NzljNy40Ni0yLjU4LDExLjQzLTEwLjcyLDguODUtMTguMTgKCQlDODcuOTYsOTkuMTEsODIuNDEs"
-    "OTUuNCw3Ni40OCw5NS40TDc2LjQ4LDk1LjR6Ii8+CjwvZz4KPGc+Cgk8cGF0aCBzdHlsZT0iZmls"
-    "bDojRjQ0MzM2OyIgZD0iTTc2LjQ4LDEwMC4xOUw3Ni40OCwxMDAuMTljNC4wNSwwLDcuNjYsMi41"
-    "OCw4Ljk5LDYuNDFjMC44MywyLjQsMC42Nyw0Ljk4LTAuNDQsNy4yNgoJCWMtMS4xMSwyLjI4LTMu"
-    "MDUsNC01LjQ1LDQuODNjLTEuMDEsMC4zNS0yLjA1LDAuNTItMy4xLDAuNTJjLTQuMDUsMC03LjY2"
-    "LTIuNTgtOC45OS02LjQxYy0wLjgzLTIuNC0wLjY3LTQuOTgsMC40NC03LjI2CgkJYzEuMTEtMi4y"
-    "OCwzLjA1LTQsNS40NS00LjgzQzc0LjM5LDEwMC4zNiw3NS40MywxMDAuMTksNzYuNDgsMTAwLjE5"
-    "IE03Ni40OCw5OC4xOWMtMS4yNSwwLTIuNTEsMC4yLTMuNzYsMC42MwoJCWMtNi4wMSwyLjA3LTku"
-    "Miw4LjYyLTcuMTIsMTQuNjNjMS42NCw0Ljc2LDYuMSw3Ljc2LDEwLjg4LDcuNzZjMS4yNSwwLDIu"
-    "NTEtMC4yLDMuNzYtMC42M2M2LjAxLTIuMDcsOS4yLTguNjIsNy4xMi0xNC42MwoJCUM4NS43Miwx"
-    "MDEuMTgsODEuMjYsOTguMTksNzYuNDgsOTguMTlMNzYuNDgsOTguMTl6Ii8+CjwvZz4KPGc+Cgk8"
-    "bGluZSBzdHlsZT0iZmlsbDpub25lO3N0cm9rZTojRjQ0MzM2O3N0cm9rZS13aWR0aDozO3N0cm9r"
-    "ZS1taXRlcmxpbWl0OjEwOyIgeDE9Ijg2LjU3IiB5MT0iMTA5LjciIHgyPSI2Ni40IiB5Mj0iMTA5"
-    "LjciLz4KCTxsaW5lIHN0eWxlPSJmaWxsOm5vbmU7c3Ryb2tlOiNGNDQzMzY7c3Ryb2tlLXdpZHRo"
-    "OjM7c3Ryb2tlLW1pdGVybGltaXQ6MTA7IiB4MT0iNzEuNDQiIHkxPSIxMDAuOTYiIHgyPSI4MS41"
-    "MyIgeTI9IjExOC40MyIvPgoJPGxpbmUgc3R5bGU9ImZpbGw6bm9uZTtzdHJva2U6I0Y0NDMzNjtz"
-    "dHJva2Utd2lkdGg6MztzdHJva2UtbWl0ZXJsaW1pdDoxMDsiIHgxPSI3MS40NCIgeTE9IjExOC40"
-    "MyIgeDI9IjgxLjUzIiB5Mj0iMTAwLjk2Ii8+CjwvZz4KPHBhdGggc3R5bGU9ImZpbGw6I0UyQTYx"
-    "MDsiIGQ9Ik0xMTkuNTgsODkuNTZIODAuNmMtMS40NSwwLTIuNjMtMS4xOC0yLjYzLTIuNjN2LTMu"
-    "MzFoNDQuMjN2My4zMQoJQzEyMi4yMSw4OC4zOCwxMjEuMDMsODkuNTYsMTE5LjU4LDg5LjU2eiIv"
-    "Pgo8bGluZSBzdHlsZT0iZmlsbDpub25lO3N0cm9rZTojRkZDQTI4O3N0cm9rZS13aWR0aDozO3N0"
-    "cm9rZS1saW5lY2FwOnJvdW5kO3N0cm9rZS1taXRlcmxpbWl0OjEwOyIgeDE9Ijc3Ljk3IiB5MT0i"
-    "ODIuNjIiIHgyPSIxMjIuMjEiIHkyPSI4Mi42MiIvPgo8bGluZSBzdHlsZT0iZmlsbDpub25lO3N0"
-    "cm9rZTojRTJBNjEwO3N0cm9rZS13aWR0aDozO3N0cm9rZS1saW5lY2FwOnJvdW5kO3N0cm9rZS1t"
-    "aXRlcmxpbWl0OjEwOyIgeDE9IjU2LjEyIiB5MT0iOTguNDUiIHgyPSIzNC4xNyIgeTI9Ijk4LjQ1"
-    "Ii8+CjxnPgoJPHBvbHlsaW5lIHN0eWxlPSJmaWxsOm5vbmU7c3Ryb2tlOiNFMkE2MTA7c3Ryb2tl"
-    "LXdpZHRoOjM7c3Ryb2tlLWxpbmVjYXA6cm91bmQ7c3Ryb2tlLW1pdGVybGltaXQ6MTA7IiBwb2lu"
-    "dHM9IjExMS4xNCwxMDkuNyAKCQk4MC45OCwxMDkuNyA1My4zLDk3LjU3IAkiLz4KPC9nPgo8cGF0"
-    "aCBzdHlsZT0iZmlsbDojNjE2MTYxOyIgZD0iTTIyLjYxLDYxLjljMCwwLTIuODYsNC4yMi0yLjg2"
-    "LDEzLjgzczIuOTUsMTMuNzUsMi45NSwxMy43NXMwLjgxLTIuNSwwLjgxLTEyLjMKCVMyMi42MSw2"
-    "MS45LDIyLjYxLDYxLjl6Ii8+CjxwYXRoIHN0eWxlPSJmaWxsOiM0MjQyNDI7IiBkPSJNMTcuNDcs"
-    "NzMuMjVoMi45N2MwLDAsMC4zOCwwLjI1LDAuMzgsMi40NHMtMC4zOCwyLjQ0LTAuMzgsMi40NGgt"
-    "Mi45N1Y3My4yNXoiLz4KPHBhdGggc3R5bGU9ImZpbGw6Izc1NzU3NTsiIGQ9Ik0xOC43Myw3NS42"
-    "OWMwLDIuMzksMC4wMSw0LjMzLTAuNjcsNC4zM2MtMC42OCwwLTEuNzktMS45NC0xLjc5LTQuMzNz"
-    "MS4xMS00LjMzLDEuNzktNC4zMwoJQzE4Ljc0LDcxLjM2LDE4LjczLDczLjMsMTguNzMsNzUuNjl6"
-    "Ii8+CjxwYXRoIHN0eWxlPSJmaWxsOiMyMTIxMjE7IiBkPSJNMjMuMTQsODYuMThjLTAuMjIsMi4w"
-    "NS0wLjQ1LDMuMy0wLjQ1LDMuM2wxNi42MSwwLjAxYzAsMCwwLjE3LTEuMDYsMC4zMi0zLjE0Cglj"
-    "MC4xMS0xLjQ3LTEuMDYtMi43Mi0yLjU0LTIuNzJoLTExLjFDMjQuNTIsODMuNjIsMjMuMjksODQu"
-    "NzIsMjMuMTQsODYuMTh6Ii8+CjxyZWN0IHg9IjMzLjEzIiB5PSI5Mi4zNiIgc3R5bGU9ImZpbGw6"
-    "IzYwNjA2MDsiIHdpZHRoPSIxNS4zNSIgaGVpZ2h0PSIxMy4yMiIvPgo8ZWxsaXBzZSBzdHlsZT0i"
-    "ZmlsbDojNjA2MDYwOyIgY3g9IjQ4LjQ4IiBjeT0iOTguOTciIHJ4PSIxLjU1IiByeT0iNi42MSIv"
-    "Pgo8ZWxsaXBzZSBzdHlsZT0iZmlsbDojNjA2MDYwOyIgY3g9IjMzLjEzIiBjeT0iOTguOTciIHJ4"
-    "PSIxLjU1IiByeT0iNi42MSIvPgo8cGF0aCBzdHlsZT0iZmlsbDojNzg5MDlDOyIgZD0iTTQ3LjYx"
-    "LDk2LjU3SDMzLjg4Yy0wLjUyLDAtMC44OC0wLjQ3LTAuNzktMC45OGMwLjE1LTAuODYsMC4zLTEu"
-    "NDksMC43OC0xLjg4CgljMC4xMi0wLjEsMC4yOS0wLjEzLDAuNDUtMC4xM2gxMi45MWMwLjIxLDAs"
-    "MC40MywwLjA3LDAuNTYsMC4yM2MwLjQ1LDAuNTEsMC42MSwxLjAzLDAuNjIsMS44MwoJQzQ4LjQx"
-    "LDk2LjE5LDQ4LjExLDk2LjU3LDQ3LjYxLDk2LjU3eiIvPgo8cG9seWdvbiBzdHlsZT0iZmlsbDoj"
-    "MDA0RDQwOyIgcG9pbnRzPSIxMjIuMiw0MC40NSA3Ny45OSw0MC40NSA3NS4xNSwzOC45NCAxMjUu"
-    "MDQsMzguOTQgIi8+CjxyZWN0IHg9Ijc1LjE1IiB5PSIzNS4xOCIgc3R5bGU9ImZpbGw6IzAwNzk2"
-    "QjsiIHdpZHRoPSI0OS44OSIgaGVpZ2h0PSIzLjc2Ii8+CjxwYXRoIHN0eWxlPSJmaWxsOm5vbmU7"
-    "c3Ryb2tlOiNDNjI4Mjg7c3Ryb2tlLXdpZHRoOjI7c3Ryb2tlLW1pdGVybGltaXQ6MTA7IiBkPSJN"
-    "MTA4LjE5LDY5LjU0YzAsMC41Mi0wLjQ3LDAuOTQtMS4wNiwwLjk0SDkzLjMxCgljLTAuNTgsMC0x"
-    "LjA2LTAuNDItMS4wNi0wLjk0VjUyLjQ1YzAuNjYtMC44OCwzLjEtMy42MSw3Ljk3LTMuNjFjNC44"
-    "OCwwLDcuMzEsMi43Myw3Ljk3LDMuNjFWNjkuNTR6Ii8+Cjwvc3ZnPgo="
-)
-
-# heading → pygame.transform.rotate angle (sprite points right = East)
 _HEADING_ROT = {
     'E':  0, 'NE': 45, 'N':  90, 'NW': 135,
     'W': 180, 'SW': 225, 'S': 270, 'SE': 315,
@@ -907,70 +611,7 @@ _HEADING_VEC = {
     'S':  (0,  1),  'SW': (-0.707,  0.707), 'W': (-1, 0),   'NW': (-0.707, -0.707),
 }
 
-# Cached base sprite (raw Noto, no tint) — loaded once
-_BASE_SPRITE_CACHE: dict = {}   # size → pygame.Surface
 
-
-def _load_base_sprite(size: int = 48) -> pygame.Surface:
-    """
-    Decode the embedded SVG and render it via rsvg-convert to a pygame SRCALPHA surface.
-    Falls back to a simple colored rectangle if rsvg-convert is unavailable.
-    Cached per size so it only runs once.
-    """
-    if size in _BASE_SPRITE_CACHE:
-        return _BASE_SPRITE_CACHE[size]
-
-    surf = None
-    try:
-        import subprocess, tempfile, os
-        svg_bytes = base64.b64decode(_TRAIN_SVG_B64)
-        with tempfile.NamedTemporaryFile(suffix='.svg', delete=False) as f:
-            f.write(svg_bytes)
-            svg_path = f.name
-        png_path = svg_path.replace('.svg', '.png')
-        result = subprocess.run(
-            ['rsvg-convert', '-w', str(size), '-h', str(size), svg_path, '-o', png_path],
-            capture_output=True, timeout=10
-        )
-        if result.returncode == 0:
-            pil_img = Image.open(png_path).convert('RGBA')
-            mode = pil_img.mode
-            raw  = pil_img.tobytes()
-            surf = pygame.image.fromstring(raw, pil_img.size, mode).convert_alpha()
-        os.unlink(svg_path)
-        if os.path.exists(png_path):
-            os.unlink(png_path)
-    except Exception:
-        pass
-
-    if surf is None:
-        # Fallback: simple locomotive silhouette drawn with pygame
-        surf = pygame.Surface((size, size), pygame.SRCALPHA)
-        body_h = int(size * 0.45)
-        oy = (size - body_h) // 2
-        pygame.draw.rect(surf, (80, 80, 90), (4, oy, size - 8, body_h), border_radius=6)
-        pygame.draw.rect(surf, (60, 60, 70), (size - 14, oy - 4, 12, body_h + 8), border_radius=4)
-        pygame.draw.circle(surf, (200, 200, 210), (size - 7, oy + body_h // 2), 4)
-
-    _BASE_SPRITE_CACHE[size] = surf
-    return surf
-
-
-def _make_train_sprite(color: tuple, size: int = 48) -> pygame.Surface:
-    """
-    Return a tinted copy of the Noto train sprite.
-    The original Noto colors are preserved but overlaid with a soft color wash
-    so each route's trains have a recognizable accent color.
-    """
-    base = _load_base_sprite(size)
-    tinted = base.copy()
-
-    r, g, b = color
-    # Create a semi-transparent color wash surface and blend it over the sprite
-    wash = pygame.Surface(tinted.get_size(), pygame.SRCALPHA)
-    wash.fill((r, g, b, 55))   # 55/255 ≈ 22% tint — subtle, preserves detail
-    tinted.blit(wash, (0, 0), special_flags=pygame.BLEND_RGBA_ADD)
-    return tinted
 
 
 class MapRenderer:
@@ -980,7 +621,6 @@ class MapRenderer:
         self.width = width
         self.height = height
         self.zoom = TILE_ZOOM
-        self.tile_overlay = MapTileOverlay(OSM_TILE_URL)
 
         # fractional tile position of the origin lat/lon
         lat_r = math.radians(ORIGIN_LAT)
@@ -1004,46 +644,60 @@ class MapRenderer:
 
         self._surface = pygame.Surface((width, height))
         self._static_surface = pygame.Surface((width, height))
-        self._tone_overlay = pygame.Surface((width, height), pygame.SRCALPHA)
-        self._tone_overlay.fill((0, 0, 0, 55))
-        self._total_tiles = self.tiles_x * self.tiles_y
-        self._tiles_drawn_last = 0
         self._static_cache_key = None
-        self._last_static_refresh = 0.0
-        self._tile_refresh_interval_sec = 0.5
 
         self._station_label_cache: dict[str, pygame.Surface] = {}
         self._num_font_small = pygame.font.Font(None, 15)
         self._num_font_large = pygame.font.Font(None, 18)
         self._train_num_cache: dict[tuple[str, int], tuple[pygame.Surface, pygame.Surface]] = {}
 
-    def _render_static_layer(self, infrastructure: dict, font_small: pygame.font.Font):
-        """Render static map parts: tiles, infrastructure, and fixed markers."""
-        self._static_surface.fill(C_BG)
+        self._tile_base: pygame.Surface | None = None
+        self._load_or_build_tile_base()
 
-        tile_drawn = 0
+    def _load_or_build_tile_base(self):
+        """Load pre-rendered map PNG or build it by downloading tiles, then save it."""
+        map_path = f"map_{self.width}x{self.height}.png"
+        if os.path.exists(map_path):
+            self._tile_base = pygame.image.load(map_path).convert()
+            return
+
+        print(f"Building tile base {map_path} …", flush=True)
+        surf = pygame.Surface((self.width, self.height))
+        surf.fill((16, 22, 32))
+        session = requests.Session()
+        session.headers.update({
+            "User-Agent": "TrainStationKiosk/1.0 (train enthusiast display; contact: kiosk@local)"
+        })
         for dx in range(self.tiles_x):
             for dy in range(self.tiles_y):
                 tx = self.origin_tile_x + dx
                 ty = self.origin_tile_y + dy
                 px = int(self._cx_px + (tx - self._origin_ftx) * TILE_SIZE)
                 py = int(self._cy_px + (ty - self._origin_fty) * TILE_SIZE)
-                tile = self.tile_overlay.get(self.zoom, tx, ty)
-                if tile is not None:
-                    self._static_surface.blit(tile, (px, py))
-                    tile_drawn += 1
-                else:
-                    pygame.draw.rect(self._static_surface, (16, 22, 32), pygame.Rect(px, py, TILE_SIZE, TILE_SIZE))
+                url = OSM_TILE_URL.replace("{z}", str(self.zoom)).replace("{x}", str(tx)).replace("{y}", str(ty))
+                try:
+                    resp = session.get(url, timeout=15)
+                    _log_http("GET", url, f"status={resp.status_code}")
+                    if resp.status_code == 200:
+                        img = Image.open(io.BytesIO(resp.content)).convert("RGBA")
+                        tile_surf = pygame.image.fromstring(img.tobytes(), img.size, "RGBA")
+                        surf.blit(tile_surf, (px, py))
+                    else:
+                        pygame.draw.rect(surf, (16, 22, 32), pygame.Rect(px, py, TILE_SIZE, TILE_SIZE))
+                except Exception:
+                    _log_http("GET", url, "error")
+                    pygame.draw.rect(surf, (16, 22, 32), pygame.Rect(px, py, TILE_SIZE, TILE_SIZE))
 
-        if tile_drawn == 0:
-            grid_color = (20, 28, 40)
-            for gx in range(0, self.width, 64):
-                pygame.draw.line(self._static_surface, grid_color, (gx, 0), (gx, self.height), 1)
-            for gy in range(0, self.height, 64):
-                pygame.draw.line(self._static_surface, grid_color, (0, gy), (self.width, gy), 1)
+        tone = pygame.Surface((self.width, self.height), pygame.SRCALPHA)
+        tone.fill((0, 0, 0, 55))
+        surf.blit(tone, (0, 0))
+        pygame.image.save(surf, map_path)
+        self._tile_base = surf.convert()
 
-        self._tiles_drawn_last = tile_drawn
-        self._static_surface.blit(self._tone_overlay, (0, 0))
+    def _render_static_layer(self, infrastructure: dict, font_small: pygame.font.Font):
+        """Render static map parts: tile base, infrastructure, and fixed markers."""
+        self._static_surface.fill(C_BG)
+        self._static_surface.blit(self._tile_base, (0, 0))
 
         tracks = (infrastructure or {}).get("tracks", [])
         for tr in tracks:
@@ -1053,7 +707,8 @@ class MapRenderer:
             px_pts = []
             for lat, lon in pts:
                 px, py = self._latlon_to_px(lat, lon)
-                if -128 <= px <= self.width + 128 and -128 <= py <= self.height + 128:
+                if (-RENDER_BOUNDS_MARGIN <= px < self.width + RENDER_BOUNDS_MARGIN and
+                    -RENDER_BOUNDS_MARGIN <= py < self.height + RENDER_BOUNDS_MARGIN):
                     px_pts.append((px, py))
             if len(px_pts) < 2:
                 continue
@@ -1070,7 +725,8 @@ class MapRenderer:
             if slat is None or slon is None:
                 continue
             px, py = self._latlon_to_px(slat, slon)
-            if -10 <= px < self.width + 10 and -10 <= py < self.height + 10:
+            if (-RENDER_BOUNDS_MARGIN <= px < self.width + RENDER_BOUNDS_MARGIN and
+                -RENDER_BOUNDS_MARGIN <= py < self.height + RENDER_BOUNDS_MARGIN):
                 pygame.draw.circle(self._static_surface, C_STATION_DOT, (px, py), 5)
                 pygame.draw.circle(self._static_surface, C_TEXT, (px, py), 5, 1)
                 lbl = self._station_label_cache.get(sname)
@@ -1090,17 +746,16 @@ class MapRenderer:
         if radius_px > 10:
             pygame.draw.circle(self._static_surface, C_PANEL_BORDER, (ox, oy), radius_px, 1)
 
-        self._last_static_refresh = time.time()
-
     def _latlon_to_px(self, lat, lon):
-        """Convert lat/lon to pixel coordinates on the map surface."""
+        """Convert lat/lon to pixel coordinates on the map surface.
+        Uses consistent rounding to avoid cross-system precision differences."""
         lat_r = math.radians(lat)
         n = 2 ** self.zoom
         ftx = (lon + 180.0) / 360.0 * n
         fty = (1.0 - math.asinh(math.tan(lat_r)) / math.pi) / 2.0 * n
         px = self._cx_px + (ftx - self._origin_ftx) * TILE_SIZE
         py = self._cy_px + (fty - self._origin_fty) * TILE_SIZE
-        return int(px), int(py)
+        return round(px), round(py)
 
     def _px_to_latlon(self, px: float, py: float):
         """Inverse projection from map-surface pixel to lat/lon."""
@@ -1126,20 +781,13 @@ class MapRenderer:
 
     def render(self, surface: pygame.Surface, infrastructure: dict, trains: list,
                font_label: pygame.font.Font, font_small: pygame.font.Font,
-               dest_xy: tuple[int, int] = (0, 0)) -> bool:
-        """Draw map onto the provided surface. Returns True if the static layer was rebuilt."""
+               dest_xy: tuple[int, int] = (0, 0)):
+        """Draw map (tile base, tracks, stations, trains) onto surface at dest_xy."""
         tracks = (infrastructure or {}).get("tracks", [])
         stations = (infrastructure or {}).get("stations", [])
         static_key = (len(tracks), len(stations), font_small.get_height())
 
-        now = time.time()
         needs_static_refresh = (self._static_cache_key != static_key)
-        if not needs_static_refresh:
-            _, pending_tiles = self.tile_overlay.get_stats()
-            tile_incomplete = self._tiles_drawn_last < self._total_tiles
-            if (pending_tiles > 0 or tile_incomplete) and (now - self._last_static_refresh) >= self._tile_refresh_interval_sec:
-                needs_static_refresh = True
-
         if needs_static_refresh:
             self._render_static_layer(infrastructure, font_small)
             self._static_cache_key = static_key
@@ -1153,7 +801,8 @@ class MapRenderer:
             if not tlat or not tlon:
                 continue
             px, py = self._latlon_to_px(tlat, tlon)
-            if -80 <= px < self.width + 80 and -80 <= py < self.height + 80:
+            if (-RENDER_BOUNDS_MARGIN <= px < self.width + RENDER_BOUNDS_MARGIN and
+                -RENDER_BOUNDS_MARGIN <= py < self.height + RENDER_BOUNDS_MARGIN):
                 num      = str(train.get("trainNum", "?"))
                 heading  = (train.get("heading") or "E").upper().strip()
                 if heading not in _HEADING_ROT:
@@ -1214,13 +863,8 @@ class MapRenderer:
                 self._surface.blit(num_surf, (tx, ty))
 
         surface.blit(self._surface, dest_xy)
-        return needs_static_refresh
 
-    def render_trains_only(self, surface: pygame.Surface, trains: list,
-                           dest_xy: tuple[int, int] = (0, 0)):
-        """Blit only the live train layer onto surface, without touching the static layer.
-        Designed for Pi-optimised per-tick updates where only train dots move."""
-        # Start from the last-rendered static layer (already in self._static_surface)
+
         self._surface.blit(self._static_surface, (0, 0))
         for train in trains:
             tlat = train.get("lat")
@@ -1228,7 +872,8 @@ class MapRenderer:
             if not tlat or not tlon:
                 continue
             px, py = self._latlon_to_px(tlat, tlon)
-            if -80 <= px < self.width + 80 and -80 <= py < self.height + 80:
+            if (-RENDER_BOUNDS_MARGIN <= px < self.width + RENDER_BOUNDS_MARGIN and
+                -RENDER_BOUNDS_MARGIN <= py < self.height + RENDER_BOUNDS_MARGIN):
                 num     = str(train.get("trainNum", "?"))
                 heading = (train.get("heading") or "E").upper().strip()
                 if heading not in _HEADING_ROT:
@@ -1631,9 +1276,6 @@ class TrainStationApp:
         self._header_surface: pygame.Surface | None = None
         self._header_cache_key = None
         self._footer_surface: pygame.Surface | None = None
-        # composited background (map + static panels) written once per data update
-        self._bg_surface: pygame.Surface | None = None
-        self._bg_dirty = True
 
         # data state
         self._amtrak_trains = []   # live train positions for map
@@ -1641,14 +1283,6 @@ class TrainStationApp:
         self._bbox = self.map_renderer.get_view_bbox(pad_px=120)
         self._last_data_update = 0
         self._data_lock = threading.Lock()
-        # Separate dirty flag for train positions — set only when new train data arrives.
-        # Lets us skip render_trains_only entirely between 30s data fetches.
-        self._trains_dirty = True
-        # Cached map-area surface (static layer + current train dots). Blitted cheaply
-        # onto screen each tick without any re-rendering when trains haven't moved.
-        self._map_with_trains: pygame.Surface = pygame.Surface(
-            (self.map_rect.width, self.map_rect.height)
-        )
 
         # kick off first data fetch in background
         self._schedule_data_update()
@@ -1687,7 +1321,6 @@ class TrainStationApp:
             if amtrak_trains is not None:
                 self._amtrak_trains = amtrak_trains
                 self._last_data_update = time.time()
-                self._trains_dirty = True   # new positions → rebuild map+trains cache
             if infrastructure is not None:
                 self._infrastructure = infrastructure
 
@@ -1700,7 +1333,6 @@ class TrainStationApp:
                 and min_lon <= e.get("train_lon", 0) <= max_lon
             ]
             self.schedule_panel.update(visible_sched)
-        self._bg_dirty = True
 
     def _schedule_data_update(self):
         t = threading.Thread(target=self._fetch_data, daemon=True)
@@ -1753,37 +1385,10 @@ class TrainStationApp:
     def run(self):
         running = True
         last_update_check = 0
-        _HEADER_INTERVAL   = 30.0   # clock only shows HH:MM — redraw once per minute is plenty
-        _SCHEDULE_INTERVAL = 1.0    # schedule panel: once per second is plenty
-        _PROGRESS_INTERVAL = _SCHEDULE_INTERVAL  # motd no longer animates; redraw with schedule
-        _last_header_draw   = 0.0
-        _last_progress_draw = 0.0
-        _last_schedule_draw = 0.0
-        # _static_bg: full screen — map static layer + all panels. No train dots, no clock.
-        # Rebuilt only when infrastructure/tiles/panels change.
-        _static_bg: pygame.Surface = pygame.Surface((self.screen_w, self.screen_h))
-        _static_bg_dirty = True
-        # _map_with_trains: map-area surface (static layer + current train dots).
-        # Rebuilt only when _static_bg or train positions change — typically every 30 s.
-        # Between rebuilds it is blitted as-is; no rendering work at all.
-        _map_cache = self._map_with_trains   # local alias
-
-        # ── perf profiler ─────────────────────────────────────────────
-        # Accumulates wall-clock time (ms) per named operation and prints
-        # a report every PERF_REPORT_SEC seconds so we can see what's slow.
-        PERF_REPORT_SEC = 10
-        _perf: dict[str, float] = {}
-        _perf_calls: dict[str, int] = {}
-        _perf_last_report = time.time()
-
-        def _pt(label: str, t0: float):
-            """Record elapsed ms since t0 under label."""
-            ms = (time.time() - t0) * 1000
-            _perf[label] = _perf.get(label, 0.0) + ms
-            _perf_calls[label] = _perf_calls.get(label, 0) + 1
+        last_render = 0.0
+        RENDER_INTERVAL = 5.0
 
         while running:
-            _tick_start = time.time()
 
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
@@ -1804,149 +1409,35 @@ class TrainStationApp:
                 self._schedule_data_update()
                 last_update_check = now
 
-            # ── detect what changed ──────────────────────────────────
-            _, pending_tiles = self.map_renderer.tile_overlay.get_stats()
-            tile_incomplete = self.map_renderer._tiles_drawn_last < self.map_renderer._total_tiles
-            tiles_arrived = (pending_tiles == 0 and tile_incomplete)
-            if self._bg_dirty or tiles_arrived:
-                _static_bg_dirty = True
-
-            # ── LEVEL 1: full static rebuild ─────────────────────────
-            if _static_bg_dirty:
-                _static_bg.fill(C_BG)
+            if now - last_render >= RENDER_INTERVAL:
                 with self._data_lock:
                     trains = self._amtrak_trains[:]
                     infrastructure = self._infrastructure
 
-                t0 = time.time()
+                self.screen.fill(C_BG)
                 self.map_renderer.render(
-                    _static_bg, infrastructure, trains,
+                    self.screen, infrastructure, trains,
                     self.font_body, self.font_small,
                     self.map_rect.topleft
                 )
-                _pt("L1:map_render", t0)
-
                 b = self._map_border_px
-                pygame.draw.rect(_static_bg, C_PANEL_BORDER,
-                                 pygame.Rect(0, 0, self.map_rect.width, self.map_rect.height), b)
+                pygame.draw.rect(self.screen, C_PANEL_BORDER,
+                                 pygame.Rect(self.map_rect.left, self.map_rect.top,
+                                             self.map_rect.width, self.map_rect.height), b)
                 self._render_footer_hint()
                 if self._footer_surface is not None:
-                    _static_bg.blit(
+                    self.screen.blit(
                         self._footer_surface,
                         (PANEL_GAP, self.screen_h - self._footer_surface.get_height() - 8)
                     )
-
-                t0 = time.time()
                 self.motd_panel.update()
-                self.schedule_panel.render(
-                    _static_bg, self.font_title, self.font_body, self.font_small
-                )
-                self.motd_panel.render(_static_bg, self.font_title, self.font_small)
-                _pt("L1:panels", t0)
-
-                t0 = time.time()
-                self.map_renderer.render_trains_only(_map_cache, trains)
-                b = self._map_border_px
-                pygame.draw.rect(_map_cache, C_PANEL_BORDER,
-                                 pygame.Rect(0, 0, self.map_rect.width, self.map_rect.height), b)
-                _pt("L1:trains_only", t0)
-                self._trains_dirty = False
-
-                t0 = time.time()
-                self.screen.blit(_static_bg, (0, 0))
-                self.screen.blit(_map_cache, self.map_rect.topleft)
-                self._render_header()
-                _pt("L1:blit_to_screen", t0)
-
-                t0 = time.time()
-                pygame.display.flip()
-                _pt("L1:display_flip", t0)
-
-                _last_header_draw   = now
-                _last_progress_draw = now
-                _last_schedule_draw = now
-                _static_bg_dirty = False
-                self._bg_dirty = False
-                _pt("tick_total", _tick_start)
-                self.clock.tick(FPS_CAP)
-                continue
-
-            # ── LEVEL 2: train positions changed (~30 s) ─────────────
-            if self._trains_dirty:
-                with self._data_lock:
-                    trains = self._amtrak_trains[:]
-
-                t0 = time.time()
-                self.map_renderer.render_trains_only(_map_cache, trains)
-                b = self._map_border_px
-                pygame.draw.rect(_map_cache, C_PANEL_BORDER,
-                                 pygame.Rect(0, 0, self.map_rect.width, self.map_rect.height), b)
-                _pt("L2:trains_only", t0)
-                self._trains_dirty = False
-
-                t0 = time.time()
-                self.screen.blit(_map_cache, self.map_rect.topleft)
-                self._render_header()
-                _pt("L2:blit_to_screen", t0)
-
-                t0 = time.time()
-                pygame.display.update([self.map_rect, self.header_rect])
-                _pt("L2:display_update", t0)
-
-                _last_header_draw = now
-                _pt("tick_total", _tick_start)
-                self.clock.tick(FPS_CAP)
-                continue
-
-            # ── LEVEL 3: clock / motd animation / schedule ───────────
-            dirty_rects: list[pygame.Rect] = []
-
-            if now - _last_header_draw >= _HEADER_INTERVAL:
-                t0 = time.time()
-                self._render_header()
-                _pt("L3:header", t0)
-                dirty_rects.append(self.header_rect)
-                _last_header_draw = now
-
-            if now - _last_progress_draw >= _PROGRESS_INTERVAL:
-                t0 = time.time()
-                self.motd_panel.update()
-                self.screen.blit(_static_bg, self.motd_panel.rect.topleft, self.motd_panel.rect)
-                self.motd_panel.render(self.screen, self.font_title, self.font_small)
-                _pt("L3:motd_render", t0)
-                dirty_rects.append(self.motd_panel.rect)
-                _last_progress_draw = now
-
-            if now - _last_schedule_draw >= _SCHEDULE_INTERVAL:
-                t0 = time.time()
-                sched_r = self.schedule_panel.rect
-                self.screen.blit(_static_bg, sched_r.topleft, sched_r)
                 self.schedule_panel.render(
                     self.screen, self.font_title, self.font_body, self.font_small
                 )
-                _pt("L3:sched_render", t0)
-                dirty_rects.append(sched_r)
-                _last_schedule_draw = now
-
-            if dirty_rects:
-                t0 = time.time()
-                pygame.display.update(dirty_rects)
-                _pt("L3:display_update", t0)
-
-            _pt("tick_total", _tick_start)
-
-            # ── perf report every N seconds ──────────────────────────
-            if now - _perf_last_report >= PERF_REPORT_SEC:
-                print("\n── Perf report ─────────────────────────────")
-                for k in sorted(_perf):
-                    calls = _perf_calls[k]
-                    total = _perf[k]
-                    avg   = total / calls if calls else 0
-                    print(f"  {k:<30s} {calls:5d} calls  avg {avg:7.2f} ms  total {total:8.1f} ms")
-                print("────────────────────────────────────────────\n")
-                _perf.clear()
-                _perf_calls.clear()
-                _perf_last_report = now
+                self.motd_panel.render(self.screen, self.font_title, self.font_small)
+                self._render_header()
+                pygame.display.flip()
+                last_render = now
 
             self.clock.tick(FPS_CAP)
 
